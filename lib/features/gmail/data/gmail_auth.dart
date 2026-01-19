@@ -27,12 +27,20 @@ class GmailAuth {
   String get clientId => dotenv.env['GMAIL_CLIENT_ID'] ?? '';
   String get clientSecret => dotenv.env['GMAIL_CLIENT_SECRET'] ?? '';
 
+  /// Get the local token file path
+  File get _localTokenFile {
+    final home = Platform.environment['HOME'] ?? '/tmp';
+    return File('$home/.voice_gmail_flutter_token.json');
+  }
+
   /// Check if we have valid credentials
   bool get isAuthenticated => _accessToken != null && !_isTokenExpired;
 
   bool get _isTokenExpired {
     if (_tokenExpiry == null) return true;
-    return DateTime.now().isAfter(_tokenExpiry!.subtract(const Duration(minutes: 5)));
+    return DateTime.now().isAfter(
+      _tokenExpiry!.subtract(const Duration(minutes: 5)),
+    );
   }
 
   /// Get current access token, refreshing if needed
@@ -50,15 +58,14 @@ class GmailAuth {
     return _accessToken;
   }
 
-  /// Load stored credentials from secure storage or token.json
+  /// Load stored credentials from local file or secure storage
   Future<void> _loadStoredCredentials() async {
     if (_accessToken != null) return;
 
-    // First try to load from Python app's token.json
+    // First try to load from local token file
     try {
-      final tokenFile = File('/Users/robin/git/andrew/voice_gmail_flutter/token.json');
-      if (await tokenFile.exists()) {
-        final contents = await tokenFile.readAsString();
+      if (await _localTokenFile.exists()) {
+        final contents = await _localTokenFile.readAsString();
         final data = jsonDecode(contents) as Map<String, dynamic>;
         _accessToken = data['token'] as String?;
         _refreshToken = data['refresh_token'] as String?;
@@ -67,12 +74,12 @@ class GmailAuth {
           _tokenExpiry = DateTime.tryParse(expiryStr);
         }
         if (_accessToken != null) {
-          debugPrint('Loaded credentials from token.json');
+          debugPrint('Loaded credentials from local token file');
           return;
         }
       }
     } catch (e) {
-      debugPrint('Could not load token.json: $e');
+      debugPrint('Could not load local token file: $e');
     }
 
     // Fall back to secure storage
@@ -212,7 +219,9 @@ class GmailAuth {
 
       // Update token.json file
       try {
-        final tokenFile = File('/Users/robin/git/andrew/voice_gmail_flutter/token.json');
+        final tokenFile = File(
+          '/Users/robin/git/andrew/voice_gmail_flutter/token.json',
+        );
         final tokenData = {
           'token': _accessToken,
           'refresh_token': _refreshToken,
@@ -232,7 +241,7 @@ class GmailAuth {
     }
   }
 
-  /// Save tokens to secure storage
+  /// Save tokens to secure storage, falling back to local file
   Future<void> _saveTokens(Map<String, dynamic> data) async {
     _accessToken = data['access_token'] as String?;
     if (data.containsKey('refresh_token')) {
@@ -242,11 +251,37 @@ class GmailAuth {
     final expiresIn = data['expires_in'] as int? ?? 3600;
     _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
 
-    await _secureStorage.write(key: _tokenKey, value: _accessToken);
-    if (_refreshToken != null) {
-      await _secureStorage.write(key: _refreshTokenKey, value: _refreshToken);
+    // Try secure storage first
+    try {
+      await _secureStorage.write(key: _tokenKey, value: _accessToken);
+      if (_refreshToken != null) {
+        await _secureStorage.write(key: _refreshTokenKey, value: _refreshToken);
+      }
+      await _secureStorage.write(
+        key: _expiryKey,
+        value: _tokenExpiry!.toIso8601String(),
+      );
+      debugPrint('Saved tokens to secure storage');
+    } catch (e) {
+      debugPrint('Secure storage failed, using local file: $e');
+      // Fall back to local file storage
+      await _saveTokensToFile();
     }
-    await _secureStorage.write(key: _expiryKey, value: _tokenExpiry!.toIso8601String());
+  }
+
+  /// Save tokens to local file (fallback for debug builds)
+  Future<void> _saveTokensToFile() async {
+    try {
+      final tokenData = {
+        'token': _accessToken,
+        'refresh_token': _refreshToken,
+        'expiry': _tokenExpiry?.toIso8601String(),
+      };
+      await _localTokenFile.writeAsString(jsonEncode(tokenData));
+      debugPrint('Saved tokens to local file');
+    } catch (e) {
+      debugPrint('Could not save tokens to file: $e');
+    }
   }
 
   /// Sign out and clear stored credentials
