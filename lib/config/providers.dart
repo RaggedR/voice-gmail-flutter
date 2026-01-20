@@ -1,16 +1,16 @@
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../features/addressbook/data/addressbook.dart';
-export '../features/addressbook/data/addressbook.dart' show Contact;
-import '../features/agent/domain/email_agent.dart';
-import '../features/gmail/data/email_model.dart';
-import '../features/gmail/data/gmail_auth.dart';
-import '../features/gmail/data/gmail_repository.dart';
-import '../features/speech/domain/speech_recognizer.dart';
-import '../features/speech/domain/wake_word_service.dart';
-import '../features/speech/implementations/deepgram_speech.dart';
-import '../features/speech/implementations/platform_speech.dart';
+import '../features/controller/addressbook/data/addressbook.dart';
+export '../features/controller/addressbook/data/addressbook.dart' show Contact;
+import '../features/controller/agent/domain/email_agent.dart';
+import '../features/controller/gmail/data/email_model.dart';
+import '../features/controller/gmail/data/gmail_auth.dart';
+import '../features/controller/gmail/data/gmail_repository.dart';
+import '../features/voice/domain/speech_recognizer.dart';
+import '../features/voice/domain/wake_word_service.dart';
+import '../features/voice/implementations/deepgram_speech.dart';
+import '../features/voice/implementations/platform_speech.dart';
 import '../features/tts/tts_service.dart';
 
 // ============================================
@@ -137,6 +137,11 @@ final emailAgentProvider = Provider<EmailAgent>((ref) {
         final contacts = data as List<Contact>;
         ref.read(displayContactsProvider.notifier).state = contacts;
         break;
+      case 'openAttachment':
+        final map = data as Map<String, dynamic>;
+        final index = map['index'] as int;
+        ref.read(openAttachmentRequestProvider.notifier).state = index;
+        break;
     }
   });
 });
@@ -155,3 +160,6 @@ final addressBookProvider = Provider<AddressBook>((ref) {
 
 /// Contacts to display (when list_contacts is called)
 final displayContactsProvider = StateProvider<List<Contact>?>((ref) => null);
+
+/// Attachment open request (index to open, null if none)
+final openAttachmentRequestProvider = StateProvider<int?>((ref) => null);

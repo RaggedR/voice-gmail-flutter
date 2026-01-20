@@ -20,7 +20,18 @@ dart run build_runner build --delete-conflicting-outputs
 
 # Build release
 flutter build macos
+
+# Run tests
+flutter test
+
+# Run a single test file
+flutter test test/widget_test.dart
+
+# Analyze code for errors/warnings
+flutter analyze
 ```
+
+Requires Dart SDK ^3.10.7 and Flutter 3.x.
 
 ## Testing Commands via Terminal
 
@@ -62,6 +73,10 @@ Type commands directly without wake word: `show my inbox`, `read email 1`, `scro
 - `SpeechRecognizer` interface with `DeepgramSpeechRecognizer` and `PlatformSpeechRecognizer`
 - Wake word variations in `email_screen.dart` (`kWakeWords` list) for Deepgram mishearings of "porcupine"
 
+**Storage** (`lib/features/addressbook/`)
+- Contacts stored locally using Hive (NoSQL box storage)
+- OAuth tokens stored via `flutter_secure_storage`
+
 ### Data Models
 
 Models use `freezed` + `json_serializable`. After changing models run build_runner.
@@ -72,7 +87,7 @@ Key models:
 
 ## Configuration
 
-Required `.env` file:
+Required `.env` file (loaded as Flutter asset via `flutter_dotenv`):
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
 DEEPGRAM_API_KEY=...
@@ -80,6 +95,8 @@ GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 STT_ENGINE=deepgram  # or 'platform'
 ```
+
+Note: `.env` is listed in `pubspec.yaml` assets but must NOT be committed to git.
 
 ## Important Patterns
 

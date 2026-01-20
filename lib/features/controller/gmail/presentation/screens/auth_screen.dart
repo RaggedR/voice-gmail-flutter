@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../../config/providers.dart';
-import '../../../../core/constants/colors.dart';
-import '../../../../core/constants/strings.dart';
+import '../../../../../config/providers.dart';
+import '../../../../../core/constants/colors.dart';
+import '../../../../../core/constants/strings.dart';
 
 /// Authentication screen for Gmail OAuth
 class AuthScreen extends ConsumerStatefulWidget {

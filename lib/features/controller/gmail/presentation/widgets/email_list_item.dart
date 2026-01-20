@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../../../../core/constants/colors.dart';
+import '../../../../../core/constants/colors.dart';
 import '../../data/email_model.dart';
 
 /// Gmail-style email list item widget

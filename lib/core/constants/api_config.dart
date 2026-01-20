@@ -5,8 +5,8 @@ class ApiConfig {
   /// Anthropic API
   static const String anthropicBaseUrl = 'https://api.anthropic.com';
   static const String anthropicApiVersion = '2023-06-01';
-  static const String claudeModel = 'claude-3-5-haiku-20241022';
-  static const int maxTokens = 256;  // Keep low for fast responses
+  static const String claudeModel = 'claude-opus-4-5-20251101';
+  static const int maxTokens = 512;  // Opus needs more room
 
   /// Gmail API scopes
   static const List<String> gmailScopes = [

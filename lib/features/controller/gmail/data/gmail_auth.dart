@@ -8,7 +8,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
-import '../../../core/constants/api_config.dart';
+import '../../../../core/constants/api_config.dart';
 
 /// Gmail OAuth credentials and token management for desktop
 class GmailAuth {
@@ -232,7 +232,7 @@ class GmailAuth {
     }
   }
 
-  /// Save tokens to secure storage
+  /// Save tokens to token.json file
   Future<void> _saveTokens(Map<String, dynamic> data) async {
     _accessToken = data['access_token'] as String?;
     if (data.containsKey('refresh_token')) {
@@ -242,11 +242,21 @@ class GmailAuth {
     final expiresIn = data['expires_in'] as int? ?? 3600;
     _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
 
-    await _secureStorage.write(key: _tokenKey, value: _accessToken);
-    if (_refreshToken != null) {
-      await _secureStorage.write(key: _refreshTokenKey, value: _refreshToken);
+    // Save to token.json file (skip secure storage - causes macOS issues)
+    try {
+      final tokenFile = File('/Users/robin/git/andrew/voice_gmail_flutter/token.json');
+      final tokenData = {
+        'token': _accessToken,
+        'refresh_token': _refreshToken,
+        'expiry': _tokenExpiry?.toIso8601String(),
+        'client_id': clientId,
+        'client_secret': clientSecret,
+      };
+      await tokenFile.writeAsString(jsonEncode(tokenData));
+      debugPrint('Saved tokens to token.json');
+    } catch (e) {
+      debugPrint('Error saving token.json: $e');
     }
-    await _secureStorage.write(key: _expiryKey, value: _tokenExpiry!.toIso8601String());
   }
 
   /// Sign out and clear stored credentials
@@ -255,9 +265,15 @@ class GmailAuth {
     _refreshToken = null;
     _tokenExpiry = null;
 
-    await _secureStorage.delete(key: _tokenKey);
-    await _secureStorage.delete(key: _refreshTokenKey);
-    await _secureStorage.delete(key: _expiryKey);
+    // Delete token.json
+    try {
+      final tokenFile = File('/Users/robin/git/andrew/voice_gmail_flutter/token.json');
+      if (await tokenFile.exists()) {
+        await tokenFile.delete();
+      }
+    } catch (e) {
+      debugPrint('Error deleting token.json: $e');
+    }
   }
 
   /// Cancel any pending authentication

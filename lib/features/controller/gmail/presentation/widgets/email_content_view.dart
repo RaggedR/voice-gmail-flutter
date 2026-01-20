@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_html/flutter_html.dart';
 
-import '../../../../core/constants/colors.dart';
-import '../../../../core/utils/html_utils.dart';
+import '../../../../../core/constants/colors.dart';
+import '../../../../../core/utils/html_utils.dart';
 import '../../data/email_model.dart';
 
 /// Gmail-style email content view

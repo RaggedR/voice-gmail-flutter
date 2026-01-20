@@ -4,10 +4,10 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../../config/providers.dart';
-import '../../../../main.dart' show terminalCommandController;
-import '../../../../core/constants/colors.dart';
-import '../../../../core/constants/strings.dart';
+import '../../../../../config/providers.dart';
+import '../../../../../main.dart' show terminalCommandController;
+import '../../../../../core/constants/colors.dart';
+import '../../../../../core/constants/strings.dart';
 import '../../../agent/domain/email_agent.dart' show AgentContext, EmailAgent;
 import '../widgets/email_content_view.dart';
 import '../widgets/email_list_item.dart';
@@ -41,7 +41,12 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
   final TextEditingController _commandController = TextEditingController();
   final FocusNode _commandFocus = FocusNode();
   final ScrollController _emailScrollController = ScrollController();
+  final ScrollController _inboxScrollController = ScrollController();
   StreamSubscription<String>? _terminalSubscription;
+
+  // Prevent duplicate command processing
+  String? _lastCommand;
+  DateTime? _lastCommandTime;
 
   @override
   void initState() {
@@ -62,6 +67,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     _commandController.dispose();
     _commandFocus.dispose();
     _emailScrollController.dispose();
+    _inboxScrollController.dispose();
     super.dispose();
   }
 
@@ -72,9 +78,6 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     final tts = ref.read(ttsServiceProvider);
     await tts.initialize();
     print('[EmailScreen] TTS initialized');
-
-    // Prefetch inbox in background for instant access
-    _prefetchInbox();
 
     // Initialize speech recognizer
     print('[EmailScreen] Getting speech recognizer...');
@@ -92,85 +95,55 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     }
   }
 
-  void _prefetchInbox() async {
-    final gmail = ref.read(gmailRepositoryProvider);
-    final emails = await gmail.listEmails(query: 'in:inbox', maxResults: 10);
-    if (mounted) {
-      ref.read(currentEmailsProvider.notifier).state = emails;
-      ref.read(currentFolderProvider.notifier).state = 'inbox';
-    }
-  }
-
   void _startListening() async {
     print('[EmailScreen] _startListening called');
     final speech = ref.read(speechRecognizerProvider);
 
     ref.read(isListeningProvider.notifier).state = true;
-    ref.read(statusMessageProvider.notifier).state = 'Say "Porcupine" + command...';
+    ref.read(statusMessageProvider.notifier).state = 'Listening... say "Porcupine" + command';
 
     // Start continuous streaming - onResult called for each utterance
     print('[EmailScreen] Calling speech.startListening...');
     await speech.startListening(
-      onResult: (text) async {
+      onResult: (text) {
         if (text.isEmpty || !mounted) return;
 
+        print('[STT] "$text"');
         final lowerText = text.toLowerCase();
 
         // Find any wake word variation in the text
-        int wakeWordIndex = -1;
-        int wakeWordLength = 0;
+        String? command;
         for (final wakeWord in kWakeWords) {
           final idx = lowerText.indexOf(wakeWord);
           if (idx >= 0) {
-            wakeWordIndex = idx;
-            wakeWordLength = wakeWord.length;
+            command = text.substring(idx + wakeWord.length).trim();
+            // Remove punctuation after wake word
+            while (command!.isNotEmpty && ',. !'.contains(command[0])) {
+              command = command.substring(1).trim();
+            }
             break;
           }
         }
 
-        if (wakeWordIndex >= 0) {
-          // Extract command after wake word
-          var command = text.substring(wakeWordIndex + wakeWordLength).trim();
-
-          // Remove punctuation after wake word
-          while (command.isNotEmpty && (command.startsWith(',') || command.startsWith('.') || command.startsWith('!'))) {
-            command = command.substring(1).trim();
-          }
-
-          if (command.isNotEmpty) {
-            print('\n>>> WAKE WORD DETECTED!');
-            print('>>> COMMAND: "$command"');
-            print('>>> Adding to stream...\n');
-
-            // Add to stream so all listeners (email screen, PDF viewer) receive it
-            terminalCommandController.add(command);
-            ref.read(statusMessageProvider.notifier).state = 'Say "Porcupine" + command...';
-          } else {
-            // Just wake word, prompt for command
-            final tts = ref.read(ttsServiceProvider);
-            await tts.speak("Yes?");
-          }
-        } else {
-          // No wake word - ignore
-          print('[Ignored: "${text.length > 40 ? text.substring(0, 40) + '...' : text}"]');
+        if (command != null && command.isNotEmpty) {
+          print('[STT] Command: "$command"');
+          // Show transcription in search bar
+          _commandController.text = command;
+          // Feed into same stream as text commands from nc localhost 9999
+          terminalCommandController.add(command);
         }
       },
       onError: (error) {
-        debugPrint('Speech error: $error');
-        // Reconnect quickly on error
+        print('[STT] Error: $error');
         if (mounted) {
-          Future.delayed(const Duration(milliseconds: 100), () {
-            if (mounted) _startListening();
-          });
+          ref.read(statusMessageProvider.notifier).state = 'STT error - type command or restart app';
         }
       },
       onDone: () {
-        ref.read(isListeningProvider.notifier).state = false;
-        // Reconnect quickly if closed
+        print('[STT] Connection closed');
         if (mounted) {
-          Future.delayed(const Duration(milliseconds: 100), () {
-            if (mounted) _startListening();
-          });
+          ref.read(isListeningProvider.notifier).state = false;
+          ref.read(statusMessageProvider.notifier).state = 'STT disconnected - type command or restart app';
         }
       },
     );
@@ -178,6 +151,20 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
 
   /// Process command - scroll locally, everything else goes to Claude
   Future<void> _processCommand(String text) async {
+    if (!mounted) return;
+
+    // Deduplicate - ignore same command within 2 seconds
+    final now = DateTime.now();
+    if (_lastCommand == text && _lastCommandTime != null) {
+      final elapsed = now.difference(_lastCommandTime!).inMilliseconds;
+      if (elapsed < 2000) {
+        print('[CMD] Ignoring duplicate: "$text" (${elapsed}ms ago)');
+        return;
+      }
+    }
+    _lastCommand = text;
+    _lastCommandTime = now;
+
     final stopwatch = Stopwatch()..start();
     print('[CMD] Processing: "$text"');
 
@@ -191,22 +178,25 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
 
     String? response;
 
+    try {
+
     // SCROLL - handle locally for speed (no TTS, PDF viewer also listens)
     if (lowerText.contains('down') || lowerText.contains('up')) {
       final isDown = lowerText.contains('down');
       final isUp = lowerText.contains('up');
-      if (_emailScrollController.hasClients) {
-        final current = _emailScrollController.offset;
-        final max = _emailScrollController.position.maxScrollExtent;
+      // Scroll the inbox list
+      if (_inboxScrollController.hasClients) {
+        final current = _inboxScrollController.offset;
+        final max = _inboxScrollController.position.maxScrollExtent;
         final scrollAmount = 300.0;
         if (isDown) {
-          _emailScrollController.animateTo(
+          _inboxScrollController.animateTo(
             (current + scrollAmount).clamp(0, max),
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
           );
         } else if (isUp) {
-          _emailScrollController.animateTo(
+          _inboxScrollController.animateTo(
             (current - scrollAmount).clamp(0, max),
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
@@ -221,10 +211,13 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
       response = null;
     }
     // OPEN ATTACHMENT - handle locally (needs Navigator)
-    else if ((lowerText.contains('open') || lowerText.contains('view') || lowerText.contains('download')) &&
-             (lowerText.contains('attachment') || lowerText.contains('pdf'))) {
+    // Match various transcriptions: attachment, attach, atach, atack, pdf
+    else if ((lowerText.contains('open') || lowerText.contains('view') || lowerText.contains('download') || lowerText.contains('show')) &&
+             (lowerText.contains('attach') || lowerText.contains('atach') || lowerText.contains('atack') || lowerText.contains('pdf'))) {
+      print('[CMD] Matched attachment command');
       final gmail = ref.read(gmailRepositoryProvider);
       final selectedEmail = ref.read(selectedEmailProvider);
+      print('[CMD] Selected email: ${selectedEmail?.subject}, attachments: ${selectedEmail?.attachments.length ?? 0}');
       if (selectedEmail == null) {
         response = 'Select an email first.';
       } else if (selectedEmail.attachments.isEmpty) {
@@ -258,14 +251,11 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
                 ),
               );
             }
-            response = 'Opening ${attachment.filename}.';
           } else {
             await Process.run('open', [filePath]);
-            response = 'Opened ${attachment.filename}.';
           }
-        } else {
-          response = 'Failed to download.';
         }
+        response = null; // Silent - action is obvious
       }
     }
     // EVERYTHING ELSE - send to Claude with context
@@ -281,22 +271,45 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
       );
 
       response = await agent.process(text, context: context);
+      print('[CMD] Claude response: "$response"');
 
       // Handle GUI updates from agent (email list, selected email, etc.)
       _syncAgentState(agent);
     }
 
     ref.read(isProcessingProvider.notifier).state = false;
-    ref.read(statusMessageProvider.notifier).state = response ?? 'Done.';
+    ref.read(statusMessageProvider.notifier).state = (response == null || response.isEmpty) ? 'Listening...' : response;
     print('[CMD] Done in ${stopwatch.elapsedMilliseconds}ms');
 
     // Pause mic, speak, then resume mic (prevent feedback loop)
     if (response != null && response.isNotEmpty) {
       final speech = ref.read(speechRecognizerProvider);
       await speech.stopListening();
+      if (mounted) {
+        ref.read(statusMessageProvider.notifier).state = 'Speaking...';
+      }
       await tts.speak(response);
       await Future.delayed(const Duration(milliseconds: 500));
-      if (mounted) _startListening();
+      if (mounted) {
+        ref.read(statusMessageProvider.notifier).state = 'Listening...';
+        _startListening();
+      }
+    } else {
+      // No TTS response - update status and keep listening
+      if (mounted) {
+        ref.read(statusMessageProvider.notifier).state = 'Listening...';
+      }
+    }
+
+    } catch (e, stack) {
+      print('[CMD] Error processing command: $e');
+      print('[CMD] Stack: $stack');
+      if (mounted) {
+        ref.read(isProcessingProvider.notifier).state = false;
+        ref.read(statusMessageProvider.notifier).state = 'Error: ${e.toString().split('\n').first}';
+        // Restart listening after error
+        _startListening();
+      }
     }
   }
 
@@ -402,6 +415,57 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     }
   }
 
+  /// Open attachment by index (1-based)
+  Future<void> _openAttachmentByIndex(int attachmentIndex) async {
+    final gmail = ref.read(gmailRepositoryProvider);
+    final selectedEmail = ref.read(selectedEmailProvider);
+    final tts = ref.read(ttsServiceProvider);
+
+    if (selectedEmail == null) {
+      await tts.speak('Select an email first.');
+      return;
+    }
+    if (selectedEmail.attachments.isEmpty) {
+      await tts.speak('No attachments.');
+      return;
+    }
+
+    // Convert 1-based to 0-based index
+    final idx = attachmentIndex - 1;
+    if (idx < 0 || idx >= selectedEmail.attachments.length) {
+      await tts.speak('Invalid attachment number.');
+      return;
+    }
+
+    final attachment = selectedEmail.attachments[idx];
+    ref.read(statusMessageProvider.notifier).state = 'Downloading ${attachment.filename}...';
+
+    final filePath = await gmail.downloadAttachment(
+      selectedEmail.id,
+      attachment.id,
+      attachment.filename,
+    );
+
+    if (filePath != null) {
+      if (attachment.mimeType.contains('pdf')) {
+        if (mounted) {
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (context) => PdfViewerScreen(
+                filePath: filePath,
+                filename: attachment.filename,
+              ),
+            ),
+          );
+        }
+      } else {
+        await Process.run('open', [filePath]);
+      }
+    }
+
+    ref.read(statusMessageProvider.notifier).state = 'Listening...';
+  }
+
   @override
   Widget build(BuildContext context) {
     final emails = ref.watch(currentEmailsProvider);
@@ -412,6 +476,15 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     final isProcessing = ref.watch(isProcessingProvider);
     final currentFolder = ref.watch(currentFolderProvider);
     final displayContacts = ref.watch(displayContactsProvider);
+
+    // Listen for attachment open requests from Claude's tool
+    ref.listen<int?>(openAttachmentRequestProvider, (previous, next) {
+      if (next != null) {
+        // Reset the provider immediately to prevent re-triggering
+        ref.read(openAttachmentRequestProvider.notifier).state = null;
+        _openAttachmentByIndex(next);
+      }
+    });
 
     return Scaffold(
       backgroundColor: GmailColors.background,
@@ -524,16 +597,21 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
                                     ),
                                   ),
                                 )
-                              : ListView.builder(
-                                  itemCount: emails.length,
-                                  itemBuilder: (context, index) {
-                                    return EmailListItem(
-                                      email: emails[index],
-                                      index: index + 1,
-                                      isSelected: index == selectedIndex,
-                                      onTap: () => _selectEmail(index),
-                                    );
-                                  },
+                              : Scrollbar(
+                                  controller: _inboxScrollController,
+                                  thumbVisibility: true,
+                                  child: ListView.builder(
+                                    controller: _inboxScrollController,
+                                    itemCount: emails.length,
+                                    itemBuilder: (context, index) {
+                                      return EmailListItem(
+                                        email: emails[index],
+                                        index: index + 1,
+                                        isSelected: index == selectedIndex,
+                                        onTap: () => _selectEmail(index),
+                                      );
+                                    },
+                                  ),
                                 ),
                         ),
                       ],

@@ -4,39 +4,16 @@ import '../../addressbook/data/addressbook.dart';
 import '../../gmail/data/email_model.dart';
 import '../../gmail/data/gmail_repository.dart';
 import '../../gmail/tools/gmail_tools.dart';
-import '../../window/platform/window_executor.dart';
-import '../../window/tools/window_tools.dart';
 import '../data/anthropic_client.dart';
 
 /// System prompt for the voice agent
-const String kSystemPrompt = '''You are a voice assistant for a user who cannot use their hands but CAN SEE THE SCREEN.
+const String kSystemPrompt = '''Voice email assistant.
 
-CRITICAL: The user can read perfectly fine. NEVER read email content, subjects, or bodies aloud.
-Your job is to CONTROL the app, not narrate it.
+INPUT: Speech-to-text with errors. Numbers often transcribed as homophones: "to/too"=2, "for"=4, "won"=1, "ate"=8, etc.
 
-CONTEXT:
-{context}
+OUTPUT: Silent. Just use tools. Never explain.
 
-RESPONSE STYLE:
-- Ultra brief confirmations only: "Done", "Showing inbox", "Archived", "3 emails"
-- NEVER read email content - the user can see it
-- NEVER summarize emails unless explicitly asked to "read aloud" or "summarize"
-- Just confirm actions completed
-
-ANSWER BRIEFLY FROM CONTEXT:
-- "Who sent this?" → Just the name: "John Smith"
-- "When was this sent?" → Just the date: "Yesterday at 3pm"
-- "Any attachments?" → "Yes, 2 files" or "No"
-
-USE TOOLS FOR:
-- "Show inbox" → list_emails
-- "Find emails from John" → search_emails
-- "Archive/delete this" → archive_email/delete_email
-- "Reply saying..." → reply_to_email
-- "Send email to..." → send_email
-
-Window control: "Focus Safari", "close window", "fullscreen"
-''';
+{context}''';
 
 /// Callback for GUI updates
 typedef GuiCallback = void Function(String action, dynamic data);
@@ -108,20 +85,27 @@ class EmailAgent {
   final AnthropicClient _client = AnthropicClient();
   final GmailRepository _gmail;
   final AddressBook _addressBook = AddressBook();
-  final WindowExecutor _windowExecutor = WindowExecutor();
   final GuiCallback? _onGuiUpdate;
 
   List<Email> _currentEmails = [];
   List<Map<String, dynamic>> _conversationHistory = [];
   String _currentSystemPrompt = kSystemPrompt;
 
+  // Pagination state
+  String? _currentQuery;
+  int _currentPage = 1;
+  List<String?> _pageTokens = [null]; // Index 0 = page 1 (no token needed)
+  String? _nextPageToken;
+
   EmailAgent(this._gmail, {GuiCallback? onGuiUpdate}) : _onGuiUpdate = onGuiUpdate;
 
   /// All available tools
-  List<Map<String, dynamic>> get _allTools => [...gmailTools, ...windowTools];
+  List<Map<String, dynamic>> get _allTools => gmailTools;
 
   /// Process a natural language message with context
   Future<String> process(String userMessage, {AgentContext? context}) async {
+    print('[Agent] Input: "$userMessage"');
+
     // Limit conversation history to last 10 exchanges to keep tokens low
     if (_conversationHistory.length > 20) {
       _conversationHistory = _conversationHistory.sublist(_conversationHistory.length - 20);
@@ -143,10 +127,11 @@ class EmailAgent {
         tools: _allTools,
       );
 
+      print('[Agent] Response: ${response['content']}');
       return await _handleResponse(response);
     } catch (e) {
-      debugPrint('Agent error: $e');
-      return 'Sorry, I encountered an error. Please try again.';
+      print('[Agent] Error: $e');
+      return 'Error.';
     }
   }
 
@@ -181,7 +166,7 @@ class EmailAgent {
           'content': assistantContent,
         });
 
-        // Add tool result
+        // Add tool result to history (for context in future calls)
         _conversationHistory.add({
           'role': 'user',
           'content': [
@@ -193,19 +178,12 @@ class EmailAgent {
           ],
         });
 
-        // Get Claude's final response after tool execution
-        final followUp = await _client.createMessage(
-          system: _currentSystemPrompt,
-          messages: _conversationHistory,
-          tools: _allTools,
-        );
-
-        // Recursively handle (in case of multiple tool calls)
-        return _handleResponse(followUp);
+        // Tool executed - no speech needed, user sees the result
+        return '';
       }
     }
 
-    // No tool calls - just text response
+    // No tool calls - Claude didn't understand or couldn't help
     if (assistantContent.isNotEmpty) {
       _conversationHistory.add({
         'role': 'assistant',
@@ -213,14 +191,12 @@ class EmailAgent {
       });
     }
 
-    return finalText;
+    // Don't return Claude's verbose text - just say Error
+    return 'Error.';
   }
 
-  /// Route tool execution to the appropriate handler
+  /// Execute a tool and return the result
   Future<String> _executeTool(String toolName, Map<String, dynamic> input) async {
-    if (windowToolNames.contains(toolName)) {
-      return _windowExecutor.execute(toolName, input);
-    }
     return _executeGmailTool(toolName, input);
   }
 
@@ -263,6 +239,12 @@ class EmailAgent {
         return _findContact(input);
       case 'add_sender_to_contacts':
         return _addSenderToContacts(input);
+      case 'open_attachment':
+        return _openAttachment(input);
+      case 'next_page':
+        return _nextPage(input);
+      case 'previous_page':
+        return _previousPage(input);
       default:
         return 'Unknown tool: $toolName';
     }
@@ -271,13 +253,15 @@ class EmailAgent {
   // Gmail tool implementations
 
   Future<String> _checkInbox() async {
-    final count = await _gmail.getUnreadCount();
-    if (count == 0) {
-      return 'Your inbox is empty. No unread messages.';
-    } else if (count == 1) {
-      return 'You have 1 unread message.';
+    final unreadCount = await _gmail.getUnreadCount();
+    final totalCount = await _gmail.getInboxCount();
+
+    if (unreadCount == 0) {
+      return 'You have $totalCount emails in your inbox. No unread.';
+    } else if (unreadCount == 1) {
+      return 'You have $totalCount emails in your inbox, 1 unread.';
     }
-    return 'You have $count unread messages.';
+    return 'You have $totalCount emails in your inbox, $unreadCount unread.';
   }
 
   Future<String> _listEmails(Map<String, dynamic> input) async {
@@ -285,9 +269,9 @@ class EmailAgent {
     final maxResults = input['max_results'] as int? ?? 10;
     final unreadOnly = input['unread_only'] as bool? ?? false;
 
-    // Build query
+    // Build query - inbox uses category:primary to exclude promotions/social/updates
     final folderQueries = {
-      'inbox': 'in:inbox',
+      'inbox': 'in:inbox category:primary',
       'sent': 'in:sent',
       'starred': 'is:starred',
       'drafts': 'in:drafts',
@@ -301,7 +285,33 @@ class EmailAgent {
       query = '$query is:unread'.trim();
     }
 
-    _currentEmails = await _gmail.listEmails(query: query, maxResults: maxResults);
+    // Reset pagination state for new query
+    _currentQuery = query;
+    _currentPage = 1;
+    _pageTokens = [null];
+    _nextPageToken = null;
+
+    // Fetch more emails to account for thread deduplication
+    final fetchCount = maxResults * 2;
+    final (emails, nextToken) = await _gmail.listEmailsWithPagination(
+      query: query,
+      maxResults: fetchCount,
+    );
+    _nextPageToken = nextToken;
+    print('[Pagination] Fetched ${emails.length} emails, nextToken: ${nextToken != null ? "yes" : "no"}');
+
+    // Deduplicate by threadId (keep only the first/most recent email per thread)
+    final seenThreads = <String>{};
+    final deduped = <Email>[];
+    for (final email in emails) {
+      if (!seenThreads.contains(email.threadId)) {
+        seenThreads.add(email.threadId);
+        deduped.add(email);
+        if (deduped.length >= maxResults) break;
+      }
+    }
+    _currentEmails = deduped;
+    print('[Pagination] After dedup: ${_currentEmails.length} emails');
 
     if (_currentEmails.isEmpty) {
       return 'No emails found in $folder.';
@@ -309,14 +319,134 @@ class EmailAgent {
 
     // Notify GUI
     _onGuiUpdate?.call('updateEmailList', _currentEmails);
-    _onGuiUpdate?.call('setStatus', 'Showing ${_currentEmails.length} emails from $folder');
+    final hasMore = _nextPageToken != null ? ' (more available)' : '';
+    _onGuiUpdate?.call('setStatus', '${_currentEmails.length} emails$hasMore');
 
-    return 'Here are ${_currentEmails.length} emails from $folder.';
+    return 'Showing ${_currentEmails.length} emails.$hasMore';
+  }
+
+  Future<String> _openAttachment(Map<String, dynamic> input) async {
+    final attachmentIndex = (input['attachment_index'] as int?) ?? 1;
+
+    if (_currentEmails.isEmpty) {
+      return 'No email selected.';
+    }
+
+    // Signal GUI to open attachment
+    _onGuiUpdate?.call('openAttachment', {'index': attachmentIndex});
+    return 'Opening attachment.';
+  }
+
+  Future<String> _nextPage(Map<String, dynamic> input) async {
+    print('[NextPage] Called. Token: ${_nextPageToken != null ? "yes" : "no"}, Query: $_currentQuery');
+    if (_nextPageToken == null) {
+      return 'No more emails.';
+    }
+    if (_currentQuery == null) {
+      return 'Show inbox first.';
+    }
+
+    // Store current token for going back
+    if (_currentPage >= _pageTokens.length) {
+      _pageTokens.add(_nextPageToken);
+    }
+
+    // Fetch next page - get extra for deduplication
+    final (emails, nextToken) = await _gmail.listEmailsWithPagination(
+      query: _currentQuery!,
+      maxResults: 20,
+      pageToken: _nextPageToken,
+    );
+
+    _currentPage++;
+    _nextPageToken = nextToken;
+    print('[NextPage] Fetched ${emails.length} emails, nextToken: ${nextToken != null ? "yes" : "no"}');
+
+    // Deduplicate by threadId
+    final seenThreads = <String>{};
+    final deduped = <Email>[];
+    for (final email in emails) {
+      if (!seenThreads.contains(email.threadId)) {
+        seenThreads.add(email.threadId);
+        deduped.add(email);
+        if (deduped.length >= 10) break;
+      }
+    }
+    _currentEmails = deduped;
+    print('[NextPage] After dedup: ${_currentEmails.length} emails');
+
+    if (_currentEmails.isEmpty) {
+      return 'No more emails.';
+    }
+
+    _onGuiUpdate?.call('updateEmailList', _currentEmails);
+    final hasMore = _nextPageToken != null ? ' (more available)' : '';
+    _onGuiUpdate?.call('setStatus', 'Page $_currentPage: ${_currentEmails.length} emails$hasMore');
+
+    return 'Page $_currentPage.$hasMore';
+  }
+
+  Future<String> _previousPage(Map<String, dynamic> input) async {
+    if (_currentPage <= 1) {
+      return 'Already on first page.';
+    }
+    if (_currentQuery == null) {
+      return 'Please list emails first.';
+    }
+
+    _currentPage--;
+
+    // Get the token for the previous page (or null for page 1)
+    final pageToken = _currentPage > 1 ? _pageTokens[_currentPage - 1] : null;
+
+    // Fetch previous page
+    final (emails, nextToken) = await _gmail.listEmailsWithPagination(
+      query: _currentQuery!,
+      maxResults: 10,
+      pageToken: pageToken,
+    );
+
+    _nextPageToken = nextToken;
+
+    // Deduplicate by threadId
+    final seenThreads = <String>{};
+    final deduped = <Email>[];
+    for (final email in emails) {
+      if (!seenThreads.contains(email.threadId)) {
+        seenThreads.add(email.threadId);
+        deduped.add(email);
+      }
+    }
+    _currentEmails = deduped;
+
+    _onGuiUpdate?.call('updateEmailList', _currentEmails);
+    _onGuiUpdate?.call('setStatus', 'Page $_currentPage: ${_currentEmails.length} emails');
+
+    return 'Page $_currentPage: ${_currentEmails.length} emails.';
   }
 
   Future<String> _listUnreadEmails(Map<String, dynamic> input) async {
-    final maxResults = input['max_results'] as int? ?? 10;
-    _currentEmails = await _gmail.getUnreadEmails(maxResults: maxResults);
+    final maxResults = input['max_results'] as int? ?? 20;
+
+    // Fetch more than needed to account for thread deduplication
+    final fetchCount = maxResults * 2;
+    // Use primary category to exclude promotions/social/updates
+    var emails = await _gmail.listEmails(
+      query: 'is:unread in:inbox category:primary',
+      maxResults: fetchCount,
+    );
+
+    // Deduplicate by threadId (keep only the first/most recent email per thread)
+    final seenThreads = <String>{};
+    final deduped = <Email>[];
+    for (final email in emails) {
+      if (!seenThreads.contains(email.threadId)) {
+        seenThreads.add(email.threadId);
+        deduped.add(email);
+        if (deduped.length >= maxResults) break;
+      }
+    }
+    _currentEmails = deduped;
 
     if (_currentEmails.isEmpty) {
       return 'No unread emails.';

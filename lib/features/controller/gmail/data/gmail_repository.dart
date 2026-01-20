@@ -28,11 +28,12 @@ class GmailRepository {
     };
   }
 
-  /// Get unread email count
+  /// Get unread email count from INBOX label (accurate count)
   Future<int> getUnreadCount() async {
     try {
+      // Use labels API for accurate unread count
       final response = await http.get(
-        Uri.parse('$_baseUrl/users/$_userId/messages?q=is:unread+in:inbox&maxResults=1'),
+        Uri.parse('$_baseUrl/users/$_userId/labels/INBOX'),
         headers: await _headers(),
       );
 
@@ -42,22 +43,67 @@ class GmailRepository {
       }
 
       final data = jsonDecode(response.body) as Map<String, dynamic>;
-      return data['resultSizeEstimate'] as int? ?? 0;
+      return data['messagesUnread'] as int? ?? 0;
     } catch (e) {
       debugPrint('Error getting unread count: $e');
       return 0;
     }
   }
 
-  /// List emails matching a query
-  Future<List<Email>> listEmails({
+  /// Get total email count for a query (uses estimate, may not be accurate)
+  Future<int> getEmailCount(String query) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/users/$_userId/messages').replace(
+          queryParameters: {'q': query, 'maxResults': '1'},
+        ),
+        headers: await _headers(),
+      );
+
+      if (response.statusCode != 200) {
+        return 0;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return data['resultSizeEstimate'] as int? ?? 0;
+    } catch (e) {
+      debugPrint('Error getting email count: $e');
+      return 0;
+    }
+  }
+
+  /// Get total messages in INBOX (accurate count from labels API)
+  Future<int> getInboxCount() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/users/$_userId/labels/INBOX'),
+        headers: await _headers(),
+      );
+
+      if (response.statusCode != 200) {
+        return 0;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return data['messagesTotal'] as int? ?? 0;
+    } catch (e) {
+      debugPrint('Error getting inbox count: $e');
+      return 0;
+    }
+  }
+
+  /// List emails matching a query with pagination support
+  /// Returns a record of (emails, nextPageToken)
+  Future<(List<Email>, String?)> listEmailsWithPagination({
     String query = 'in:inbox',
     int maxResults = 10,
+    String? pageToken,
   }) async {
     try {
       final queryParams = {
         'q': query,
         'maxResults': maxResults.toString(),
+        if (pageToken != null) 'pageToken': pageToken,
       };
 
       final response = await http.get(
@@ -67,20 +113,33 @@ class GmailRepository {
 
       if (response.statusCode != 200) {
         debugPrint('Failed to list emails: ${response.body}');
-        return [];
+        return (<Email>[], null);
       }
 
       final data = jsonDecode(response.body) as Map<String, dynamic>;
       final messages = data['messages'] as List<dynamic>? ?? [];
+      final nextPageToken = data['nextPageToken'] as String?;
 
       // Fetch all emails in PARALLEL for speed
       final futures = messages.map((msg) => getEmail(msg['id'] as String, includeBody: false));
       final results = await Future.wait(futures);
-      return results.whereType<Email>().toList();
+      return (results.whereType<Email>().toList(), nextPageToken);
     } catch (e) {
       debugPrint('Error listing emails: $e');
-      return [];
+      return (<Email>[], null);
     }
+  }
+
+  /// List emails matching a query (simple version without pagination)
+  Future<List<Email>> listEmails({
+    String query = 'in:inbox',
+    int maxResults = 10,
+  }) async {
+    final (emails, _) = await listEmailsWithPagination(
+      query: query,
+      maxResults: maxResults,
+    );
+    return emails;
   }
 
   /// Get unread emails

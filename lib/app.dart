@@ -4,9 +4,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'config/providers.dart';
 import 'core/constants/colors.dart';
 import 'core/constants/strings.dart';
-import 'features/gmail/presentation/screens/auth_screen.dart';
-import 'features/gmail/presentation/screens/email_screen.dart';
-import 'features/speech/presentation/speech_test_screen.dart';
+import 'features/controller/gmail/presentation/screens/auth_screen.dart';
+import 'features/controller/gmail/presentation/screens/email_screen.dart';
+import 'features/voice/presentation/speech_test_screen.dart';
 
 // Set to true to test speech recognition in isolation
 const bool kDebugSpeechTest = false;

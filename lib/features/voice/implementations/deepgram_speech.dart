@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -26,6 +27,11 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
   String _currentTranscript = '';
   Timer? _silenceTimer;
   Timer? _keepAliveTimer;
+  DateTime? _lastTranscriptTime;
+
+  // Reconnection protection
+  DateTime? _lastConnectionAttempt;
+  int _rapidReconnectCount = 0;
 
   String get _apiKey => dotenv.env['DEEPGRAM_API_KEY'] ?? '';
 
@@ -72,6 +78,23 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
   }) async {
     print('[Deepgram] startListening called');
 
+    // Protect against rapid reconnection loops
+    final now = DateTime.now();
+    if (_lastConnectionAttempt != null) {
+      final elapsed = now.difference(_lastConnectionAttempt!).inMilliseconds;
+      if (elapsed < 1000) {
+        _rapidReconnectCount++;
+        if (_rapidReconnectCount > 5) {
+          print('[Deepgram] Too many rapid reconnects, backing off for 5 seconds');
+          await Future.delayed(const Duration(seconds: 5));
+          _rapidReconnectCount = 0;
+        }
+      } else {
+        _rapidReconnectCount = 0;
+      }
+    }
+    _lastConnectionAttempt = now;
+
     if (!_isInitialized) {
       print('[Deepgram] Not initialized, initializing now...');
       final success = await initialize();
@@ -97,38 +120,42 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
 
     try {
       print('[Deepgram] Connecting to WebSocket...');
-      // Connect to Deepgram WebSocket
-      final url = 'wss://api.deepgram.com/v1/listen'
-          '?encoding=linear16'
-          '&sample_rate=16000'
-          '&channels=1'
-          '&model=nova-2'
-          '&language=en-US'
-          '&punctuate=true'
-          '&interim_results=true'
-          '&endpointing=1000'  // Wait 1s of silence before ending utterance
-          '&utterance_end_ms=2000'  // Wait 2s before utterance end event
-          '&vad_events=true';  // Voice activity detection
-
       _webSocket = await WebSocket.connect(
-        url,
+        'wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2&language=en-US&punctuate=true&interim_results=true&endpointing=1000&utterance_end_ms=2000&vad_events=true',
         headers: {'Authorization': 'Token $_apiKey'},
       );
 
       print('[Deepgram] WebSocket CONNECTED!');
       print('\n[Listening... say "Porcupine" + command]\n');
 
-      // Send keepalive pings every 5 seconds to prevent timeout
+      // Send keepalive pings every 8 seconds to prevent timeout
+      // Deepgram expects {"type": "KeepAlive"} JSON message
       _keepAliveTimer?.cancel();
-      _keepAliveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      int keepAliveCount = 0;
+      _keepAliveTimer = Timer.periodic(const Duration(seconds: 8), (_) {
         if (_webSocket != null && _webSocket!.readyState == WebSocket.open) {
-          _webSocket!.add(jsonEncode({'type': 'KeepAlive'}));
+          try {
+            _webSocket!.add('{"type": "KeepAlive"}');
+            keepAliveCount++;
+            if (keepAliveCount % 4 == 0) {
+              print('[Deepgram] Still connected (${keepAliveCount * 8}s)');
+            }
+          } catch (e) {
+            print('[Deepgram] KeepAlive send failed: $e');
+          }
+        } else {
+          print('[Deepgram] KeepAlive FAILED - WebSocket closed');
         }
       });
 
       // Handle incoming transcripts
+      int messageCount = 0;
       _webSocket!.listen(
         (data) {
+          messageCount++;
+          if (messageCount == 1) {
+            print('[Deepgram] First message received from server');
+          }
           _handleWebSocketMessage(data);
         },
         onError: (error) {
@@ -137,7 +164,7 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
           _cleanup();
         },
         onDone: () {
-          print('[Deepgram] WebSocket CLOSED');
+          print('[Deepgram] WebSocket CLOSED (received $messageCount messages, closeCode: ${_webSocket?.closeCode}, reason: ${_webSocket?.closeReason})');
           _cleanup();
         },
       );
@@ -154,6 +181,7 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
       print('[Deepgram] Audio stream started!');
 
       int chunkCount = 0;
+      int errorCount = 0;
       _audioSubscription = stream.listen(
         (chunk) {
           if (_webSocket != null && _webSocket!.readyState == WebSocket.open) {
@@ -162,11 +190,16 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
             if (chunkCount == 1) {
               print('[Audio] First chunk received! (${chunk.length} bytes)');
             }
-            if (chunkCount % 100 == 0) {
-              print('[Audio] Sent $chunkCount chunks');
+            // Log every 5 seconds worth of audio (16000 samples/sec, 16 bits, ~32000 bytes/sec)
+            if (chunkCount % 500 == 0) {
+              print('[Audio] Streaming... ($chunkCount chunks sent)');
             }
+            errorCount = 0; // Reset error count on success
           } else {
-            print('[Audio] WebSocket not open, state: ${_webSocket?.readyState}');
+            errorCount++;
+            if (errorCount == 1 || errorCount % 50 == 0) {
+              print('[Audio] WebSocket not open! state: ${_webSocket?.readyState}, errors: $errorCount');
+            }
           }
         },
         onError: (e) {
@@ -174,11 +207,16 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
         },
       );
 
-    } catch (e) {
+    } catch (e, stack) {
       print('[Deepgram] EXCEPTION: $e');
-      _onError?.call('Failed to start: $e');
+      print('[Deepgram] Stack: $stack');
       _isListening = false;
-      _onDone?.call();
+      final errorCallback = _onError;
+      final doneCallback = _onDone;
+      _onError = null;
+      _onDone = null;
+      errorCallback?.call('Failed to start: $e');
+      doneCallback?.call();
     }
   }
 
@@ -188,74 +226,82 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
 
       // Skip non-object messages (arrays, metadata, etc.)
       if (decoded is! Map<String, dynamic>) {
-        print('[Deepgram] Non-map message: ${data.toString().substring(0, 100)}...');
+        print('[Deepgram] Non-map message received');
         return;
       }
 
       final json = decoded;
-
-      // Debug: show message type
       final msgType = json['type'] as String?;
-      if (msgType != null && msgType != 'Results') {
+
+      // Log all message types for debugging
+      if (msgType != null) {
         print('[Deepgram] Message type: $msgType');
       }
 
-      // Check for transcript
-      final channel = json['channel'] as Map<String, dynamic>?;
-      final alternatives = channel?['alternatives'] as List<dynamic>?;
-
-      if (alternatives != null && alternatives.isNotEmpty) {
-        final transcript = alternatives[0]['transcript'] as String?;
-        final isFinal = json['is_final'] as bool? ?? false;
-        final speechFinal = json['speech_final'] as bool? ?? false;
-
-        if (transcript != null && transcript.isNotEmpty) {
-          if (isFinal) {
-            _currentTranscript += (transcript + ' ');
-
-            // Reset silence timer on each final transcript
-            _silenceTimer?.cancel();
-            _silenceTimer = Timer(const Duration(milliseconds: 1200), () {
-              // Silence detected - deliver the accumulated transcript
-              if (_currentTranscript.trim().isNotEmpty) {
-                final finalText = _currentTranscript.trim();
-                print('\n========================================');
-                print('YOU SAID: "$finalText"');
-                print('========================================\n');
-                _onResult?.call(finalText);
-                _currentTranscript = '';
-              }
-            });
-          }
-
-          // If speech_final, deliver immediately
-          if (speechFinal && _currentTranscript.trim().isNotEmpty) {
-            _silenceTimer?.cancel();
-            final finalText = _currentTranscript.trim();
-            print('\n========================================');
-            print('YOU SAID: "$finalText"');
-            print('========================================\n');
-            _onResult?.call(finalText);
-            _currentTranscript = '';
-          }
+      // Check for transcript - be defensive about types
+      final channelRaw = json['channel'];
+      if (channelRaw is! Map<String, dynamic>) {
+        // Not a transcript message, check for other events
+        if (msgType == 'UtteranceEnd') {
+          print('[Deepgram] UtteranceEnd event');
+          _deliverTranscript();
         }
+        return;
       }
 
-      // Check for utterance end
-      if (json['type'] == 'UtteranceEnd') {
+      final channel = channelRaw;
+      final alternativesRaw = channel['alternatives'];
+      if (alternativesRaw is! List || alternativesRaw.isEmpty) {
+        return;
+      }
+
+      final firstAlt = alternativesRaw[0];
+      if (firstAlt is! Map<String, dynamic>) {
+        return;
+      }
+
+      final transcript = firstAlt['transcript'] as String?;
+      final isFinal = json['is_final'] as bool? ?? false;
+      final speechFinal = json['speech_final'] as bool? ?? false;
+
+      // Log all transcripts including empty ones
+      if (transcript != null && transcript.isNotEmpty) {
+        print('[Deepgram] transcript: "$transcript" (isFinal=$isFinal, speechFinal=$speechFinal)');
+      }
+
+      if (transcript != null && transcript.isNotEmpty) {
+        _lastTranscriptTime = DateTime.now();
+        _currentTranscript += (transcript + ' ');
+
+        // Reset silence timer - wait for more speech or deliver after timeout
         _silenceTimer?.cancel();
-        if (_currentTranscript.trim().isNotEmpty) {
-          final finalText = _currentTranscript.trim();
-          print('\n========================================');
-          print('YOU SAID: "$finalText"');
-          print('========================================\n');
-          _onResult?.call(finalText);
-          _currentTranscript = '';
+        _silenceTimer = Timer(const Duration(milliseconds: 800), () {
+          _deliverTranscript();
+        });
+
+        // If speech_final, deliver immediately
+        if (speechFinal) {
+          print('[Deepgram] speech_final - delivering now');
+          _deliverTranscript();
         }
       }
 
-    } catch (e) {
+    } catch (e, stack) {
       debugPrint('Error parsing message: $e');
+      debugPrint('Stack: $stack');
+      debugPrint('Data: ${data.toString().substring(0, min(200, data.toString().length))}');
+    }
+  }
+
+  void _deliverTranscript() {
+    _silenceTimer?.cancel();
+    if (_currentTranscript.trim().isNotEmpty) {
+      final finalText = _currentTranscript.trim();
+      print('\n========================================');
+      print('YOU SAID: "$finalText"');
+      print('========================================\n');
+      _onResult?.call(finalText);
+      _currentTranscript = '';
     }
   }
 
@@ -265,7 +311,11 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;
     _isListening = false;
-    _onDone?.call();
+
+    // Capture and clear callback before calling to prevent loops
+    final doneCallback = _onDone;
+    _onDone = null;
+    doneCallback?.call();
   }
 
   @override
