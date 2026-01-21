@@ -6,6 +6,7 @@ import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
 import '../../../../../core/constants/colors.dart';
 import '../../../../../main.dart' show terminalCommandController;
+import '../../../../voice/domain/voice_normalizer.dart';
 
 /// Full-screen PDF viewer with continuous scroll
 class PdfViewerScreen extends StatefulWidget {
@@ -45,30 +46,49 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     // Show command in text field
     _commandController.text = command;
 
+    final normalizer = VoiceNormalizer();
+    final normalized = normalizer.normalize(lower);
+
+    // Fuzzy match for page commands: "paid", "paged", "page"
+    final hasPage = normalizer.containsFuzzyMatch(normalized, ['page'], cutoff: 70) ||
+                    normalized.contains('page') || normalized.contains('paid');
+
+    // Fuzzy match for scroll/direction
+    final hasDown = normalizer.containsFuzzyMatch(normalized, ['down'], cutoff: 80) ||
+                    normalized.contains('down');
+    final hasUp = normalizer.containsFuzzyMatch(normalized, ['up'], cutoff: 80) ||
+                  normalized.contains('up');
+    final hasScroll = normalizer.containsFuzzyMatch(normalized, ['scroll'], cutoff: 70) ||
+                      normalized.contains('scroll') || normalized.contains('scrawl');
+
+    // Fuzzy match for close commands
+    final hasClose = normalizer.containsFuzzyMatch(normalized, ['close', 'exit', 'back'], cutoff: 75) ||
+                     normalized.contains('close') || normalized.contains('exit') || normalized.contains('back');
+
     // Go to page - extract number from command
-    if (lower.contains('page')) {
-      final pageNum = _extractPageNumber(lower);
+    if (hasPage) {
+      final pageNum = _extractPageNumber(normalized);
       if (pageNum != null && pageNum >= 1 && pageNum <= _totalPages) {
         _pdfController.jumpToPage(pageNum);
         print('[PDF] Jumping to page $pageNum');
       }
     }
     // Scroll down
-    else if (lower.contains('down')) {
+    else if (hasDown || (hasScroll && hasDown)) {
       final currentY = _pdfController.scrollOffset.dy;
       final newY = currentY + _scrollAmount;
       print('[PDF] Scrolling down: $currentY -> $newY');
       _pdfController.jumpTo(yOffset: newY);
     }
     // Scroll up
-    else if (lower.contains('up')) {
+    else if (hasUp || (hasScroll && hasUp)) {
       final currentY = _pdfController.scrollOffset.dy;
       final newY = (currentY - _scrollAmount).clamp(0.0, double.infinity);
       print('[PDF] Scrolling up: $currentY -> $newY');
       _pdfController.jumpTo(yOffset: newY);
     }
     // Close PDF
-    else if (lower.contains('close') || lower.contains('exit') || lower.contains('back')) {
+    else if (hasClose) {
       Navigator.of(context).pop();
       print('[PDF] Closed');
     }

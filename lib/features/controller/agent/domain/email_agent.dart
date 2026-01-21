@@ -7,13 +7,82 @@ import '../../gmail/tools/gmail_tools.dart';
 import '../data/anthropic_client.dart';
 
 /// System prompt for the voice agent
-const String kSystemPrompt = '''Voice email assistant.
+const String kSystemPrompt = '''You are a voice-controlled email assistant for a user who cannot use their hands. They rely entirely on voice to manage their email.
 
-INPUT: Speech-to-text with errors. Numbers often transcribed as homophones: "to/too"=2, "for"=4, "won"=1, "ate"=8, etc.
+## TYPICAL USER WORKFLOW
 
-OUTPUT: Silent. Just use tools. Never explain.
+The user's main workflow is:
+1. **Inbox triage** - Open inbox, go through emails one by one, deciding to DELETE, LABEL, or ARCHIVE each
+2. **PDF review** - Find emails with PDF attachments, open them, view the PDF, scroll or jump to pages
+3. **Quick responses** - Occasionally reply to emails
 
-{context}''';
+When triaging, they'll say things like:
+- "delete this" / "trash it" / "get rid of it"
+- "archive" / "done with this"
+- "label this important" / "mark as work"
+- "next" / "next email" / "show me the next one"
+
+When viewing PDFs:
+- "open the attachment" / "show me the PDF"
+- "scroll down" / "scroll up" / "go to page 5" / "next page"
+
+## STOP AND THINK
+
+Before choosing a tool, pause and reason through:
+
+1. **WHAT did they likely say?** Speech-to-text is unreliable. The transcription you receive is often wrong.
+   - Numbers become homophones: "to/too/two"→2, "for/four"→4, "won/one"→1, "ate/eight"→8
+   - Names get mangled: "John"→"Jon"/"Juan", "Sarah"→"Sara"/"Sera"
+   - Commands get garbled: "delete"→"delayed"/"the lead", "inbox"→"in box"/"inebo", "email"→"amen"/"a male"
+   - PDF commands: "scroll"→"scrawl"/"scrol", "page"→"paid"/"paged", "attachment"→"attach mint"
+
+2. **WHY are they asking this?** Consider their workflow:
+   - Did they just list emails? → They probably want to read one
+   - Are they viewing an email? → "this/it/that" refers to THAT email
+   - Did they just read an email? → They want to DELETE, ARCHIVE, LABEL, or move to NEXT
+   - Are they viewing a PDF? → They want to SCROLL or go to a PAGE
+   - Are they composing? → "send/done/finished" means send the draft
+
+3. **WHAT do they want to accomplish?** Think about the end goal:
+   - "delayed amen" → probably "delete email" (they want to remove something)
+   - "show me John's stuff" → search for emails from John
+   - "get rid of this" → delete or archive the current email
+   - "open the file" / "show attachment" → open_attachment
+   - "scrawl down" / "go down" → scroll the PDF down
+   - "paid five" / "page 5" → go to page 5 in PDF
+
+## USE THE CONTEXT
+
+Look at the current state below. It tells you:
+- What folder they're viewing
+- Which email is selected (if any)
+- The email list with senders and subjects
+
+When they say "this", "it", "that one", "the email" → use the SELECTED email from context.
+When they say a number → it's the position in the email list (1 = first, 2 = second).
+When they mention a name → check if it matches a sender in the list OR a contact.
+
+## RESPONSE STYLE
+
+Keep responses BRIEF - they hear this via text-to-speech:
+- Good: "Deleted." / "3 unread." / "Showing inbox."
+- Bad: "I have successfully deleted the email for you."
+
+## EMAIL COMPOSITION
+
+NEVER send emails directly. Always draft first:
+1. `draft_email` or `draft_reply` → start composing
+2. `continue_draft` → user adds more content
+3. `send_draft` → user confirms sending
+4. `cancel_draft` → user abandons
+
+## CURRENT STATE
+
+{context}
+
+{action_history}
+
+{draft_status}''';
 
 /// Callback for GUI updates
 typedef GuiCallback = void Function(String action, dynamic data);
@@ -80,6 +149,35 @@ class AgentContext {
   }
 }
 
+/// Email draft being composed
+class EmailDraft {
+  String? to;
+  String? subject;
+  String body;
+  bool isReply;
+  Email? replyTo;
+
+  EmailDraft({
+    this.to,
+    this.subject,
+    this.body = '',
+    this.isReply = false,
+    this.replyTo,
+  });
+
+  String get statusDescription {
+    if (to == null && subject == null && body.isEmpty) {
+      return 'No draft in progress.';
+    }
+    final recipient = to ?? (replyTo != null ? 'reply to ${replyTo!.sender}' : 'unknown');
+    final subj = subject ?? (replyTo != null ? 'Re: ${replyTo!.subject}' : 'no subject');
+    final bodyPreview = body.length > 50 ? '${body.substring(0, 50)}...' : body;
+    return 'DRAFT IN PROGRESS:\n  To: $recipient\n  Subject: $subj\n  Body so far: "$bodyPreview"\n  Say "continue" to add more, "send" to send, or "cancel" to discard.';
+  }
+
+  bool get isEmpty => to == null && subject == null && body.isEmpty && replyTo == null;
+}
+
 /// Natural language email agent powered by Claude
 class EmailAgent {
   final AnthropicClient _client = AnthropicClient();
@@ -97,7 +195,28 @@ class EmailAgent {
   List<String?> _pageTokens = [null]; // Index 0 = page 1 (no token needed)
   String? _nextPageToken;
 
+  // Draft email state
+  EmailDraft? _currentDraft;
+
+  // Action history since current email was selected (for context)
+  List<String> _actionHistory = [];
+  int? _currentEmailIndex; // Track which email is selected
+
   EmailAgent(this._gmail, {GuiCallback? onGuiUpdate}) : _onGuiUpdate = onGuiUpdate;
+
+  /// Record an action for context history
+  void _recordAction(String action) {
+    _actionHistory.add(action);
+    // Keep last 10 actions max
+    if (_actionHistory.length > 10) {
+      _actionHistory.removeAt(0);
+    }
+  }
+
+  /// Clear action history (when selecting a new email or changing context)
+  void _clearHistory() {
+    _actionHistory.clear();
+  }
 
   /// All available tools
   List<Map<String, dynamic>> get _allTools => gmailTools;
@@ -116,9 +235,18 @@ class EmailAgent {
       'content': userMessage,
     });
 
-    // Build system prompt with context and store for recursive calls
+    // Build system prompt with context, action history, and draft status
     final contextStr = context?.toPromptString() ?? 'No context available.';
-    _currentSystemPrompt = kSystemPrompt.replaceAll('{context}', contextStr);
+    final draftStatus = _currentDraft?.isEmpty ?? true
+        ? 'No draft in progress.'
+        : _currentDraft!.statusDescription;
+    final actionHistoryStr = _actionHistory.isEmpty
+        ? 'No recent actions.'
+        : 'Recent actions:\n${_actionHistory.map((a) => '  - $a').join('\n')}';
+    _currentSystemPrompt = kSystemPrompt
+        .replaceAll('{context}', contextStr)
+        .replaceAll('{action_history}', actionHistoryStr)
+        .replaceAll('{draft_status}', draftStatus);
 
     try {
       final response = await _client.createMessage(
@@ -245,6 +373,23 @@ class EmailAgent {
         return _nextPage(input);
       case 'previous_page':
         return _previousPage(input);
+      case 'next_email':
+        return _nextEmail(input);
+      case 'previous_email':
+        return _previousEmail(input);
+      // Draft email tools
+      case 'draft_email':
+        return _draftEmail(input);
+      case 'draft_reply':
+        return _draftReply(input);
+      case 'continue_draft':
+        return _continueDraft(input);
+      case 'send_draft':
+        return _sendDraft(input);
+      case 'cancel_draft':
+        return _cancelDraft(input);
+      case 'show_draft':
+        return _showDraft(input);
       default:
         return 'Unknown tool: $toolName';
     }
@@ -268,6 +413,10 @@ class EmailAgent {
     final folder = input['folder'] as String? ?? 'inbox';
     final maxResults = input['max_results'] as int? ?? 10;
     final unreadOnly = input['unread_only'] as bool? ?? false;
+
+    // New folder view - clear history
+    _clearHistory();
+    _currentEmailIndex = null;
 
     // Build query - inbox uses category:primary to exclude promotions/social/updates
     final folderQueries = {
@@ -322,6 +471,7 @@ class EmailAgent {
     final hasMore = _nextPageToken != null ? ' (more available)' : '';
     _onGuiUpdate?.call('setStatus', '${_currentEmails.length} emails$hasMore');
 
+    _recordAction('Listed $folder (${_currentEmails.length} emails)');
     return 'Showing ${_currentEmails.length} emails.$hasMore';
   }
 
@@ -334,6 +484,7 @@ class EmailAgent {
 
     // Signal GUI to open attachment
     _onGuiUpdate?.call('openAttachment', {'index': attachmentIndex});
+    _recordAction('Opened attachment $attachmentIndex');
     return 'Opening attachment.';
   }
 
@@ -470,6 +621,12 @@ class EmailAgent {
       return 'Invalid email number. Please choose between 1 and ${_currentEmails.length}.';
     }
 
+    // If opening a different email, clear action history
+    if (_currentEmailIndex != idx) {
+      _clearHistory();
+      _currentEmailIndex = idx;
+    }
+
     final email = _currentEmails[idx];
     final fullEmail = await _gmail.getEmail(email.id, includeBody: true);
     if (fullEmail == null) {
@@ -487,12 +644,50 @@ class EmailAgent {
     final senderName = _extractSenderName(fullEmail.sender);
     _onGuiUpdate?.call('setStatus', 'Email from $senderName');
 
+    _recordAction('Opened email $emailNumber from $senderName: "${fullEmail.subject}"');
     return "Here's the email from $senderName.";
+  }
+
+  Future<String> _nextEmail(Map<String, dynamic> input) async {
+    if (_currentEmails.isEmpty) {
+      return 'No emails loaded. Please list emails first.';
+    }
+
+    // If no email selected, start at first
+    final currentIdx = _currentEmailIndex ?? -1;
+    final nextIdx = currentIdx + 1;
+
+    if (nextIdx >= _currentEmails.length) {
+      return 'No more emails. This is the last one.';
+    }
+
+    // Use _readEmail to do the actual work
+    return _readEmail({'email_number': nextIdx + 1});
+  }
+
+  Future<String> _previousEmail(Map<String, dynamic> input) async {
+    if (_currentEmails.isEmpty) {
+      return 'No emails loaded. Please list emails first.';
+    }
+
+    // If no email selected, can't go back
+    final currentIdx = _currentEmailIndex ?? 0;
+
+    if (currentIdx <= 0) {
+      return 'Already at the first email.';
+    }
+
+    // Use _readEmail to do the actual work
+    return _readEmail({'email_number': currentIdx}); // currentIdx is already 0-based, +1 would be current, so just use currentIdx for previous
   }
 
   Future<String> _searchEmails(Map<String, dynamic> input) async {
     final query = input['query'] as String;
     final maxResults = input['max_results'] as int? ?? 10;
+
+    // New search - clear history
+    _clearHistory();
+    _currentEmailIndex = null;
 
     _currentEmails = await _gmail.searchEmails(query, maxResults: maxResults);
 
@@ -503,6 +698,7 @@ class EmailAgent {
     _onGuiUpdate?.call('updateEmailList', _currentEmails);
     _onGuiUpdate?.call('setStatus', 'Search: $query');
 
+    _recordAction('Searched for "$query" (${_currentEmails.length} results)');
     return "Found ${_currentEmails.length} emails. They're on your screen.";
   }
 
@@ -573,6 +769,8 @@ class EmailAgent {
     if (success) {
       _currentEmails.removeAt(idx);
       _onGuiUpdate?.call('updateEmailList', _currentEmails);
+      _recordAction('Deleted email $emailNumber');
+      _currentEmailIndex = null; // No email selected after delete
       return 'Email moved to trash.';
     }
     return 'Failed to delete email.';
@@ -596,6 +794,8 @@ class EmailAgent {
     if (success) {
       _currentEmails.removeAt(idx);
       _onGuiUpdate?.call('updateEmailList', _currentEmails);
+      _recordAction('Archived email $emailNumber');
+      _currentEmailIndex = null; // No email selected after archive
       return 'Email archived.';
     }
     return 'Failed to archive email.';
@@ -789,4 +989,156 @@ class EmailAgent {
 
   /// Get current emails
   List<Email> get currentEmails => _currentEmails;
+
+  // Draft email tool implementations
+
+  Future<String> _draftEmail(Map<String, dynamic> input) async {
+    final to = input['to'] as String;
+    final subject = input['subject'] as String;
+    final body = input['body'] as String? ?? '';
+
+    _currentDraft = EmailDraft(
+      to: to,
+      subject: subject,
+      body: body,
+    );
+
+    // Notify GUI to show draft
+    _onGuiUpdate?.call('showDraft', {
+      'to': to,
+      'subject': subject,
+      'body': body,
+    });
+
+    _recordAction('Started draft to $to: "$subject"');
+    if (body.isEmpty) {
+      return 'Draft started to $to about "$subject". Dictate your message, say "pause" to stop, or "send" when ready.';
+    }
+    return 'Draft to $to: "$subject". Say "continue" to add more, "send" to send, or "cancel" to discard.';
+  }
+
+  Future<String> _draftReply(Map<String, dynamic> input) async {
+    final body = input['body'] as String? ?? '';
+
+    // Need a selected email to reply to
+    if (_currentEmails.isEmpty) {
+      return 'No email selected to reply to.';
+    }
+
+    // Find selected email from GUI context (assume first if none selected)
+    // In practice, the context will tell us which email is selected
+    final selectedEmail = _currentEmails.first;
+
+    _currentDraft = EmailDraft(
+      body: body,
+      isReply: true,
+      replyTo: selectedEmail,
+    );
+
+    // Notify GUI
+    _onGuiUpdate?.call('showDraft', {
+      'to': selectedEmail.sender,
+      'subject': 'Re: ${selectedEmail.subject}',
+      'body': body,
+      'isReply': true,
+    });
+
+    final senderName = _extractSenderName(selectedEmail.sender);
+    _recordAction('Started reply to $senderName');
+    if (body.isEmpty) {
+      return 'Reply to $senderName started. Dictate your message, say "pause" to stop, or "send" when ready.';
+    }
+    return 'Reply to $senderName drafted. Say "continue" to add more, "send" to send, or "cancel" to discard.';
+  }
+
+  Future<String> _continueDraft(Map<String, dynamic> input) async {
+    if (_currentDraft == null || _currentDraft!.isEmpty) {
+      return 'No draft in progress. Start with "send email to..." or "reply to this".';
+    }
+
+    final additionalText = input['additional_text'] as String;
+
+    // Append to body with space/newline
+    if (_currentDraft!.body.isEmpty) {
+      _currentDraft!.body = additionalText;
+    } else {
+      _currentDraft!.body = '${_currentDraft!.body} $additionalText';
+    }
+
+    // Notify GUI
+    _onGuiUpdate?.call('updateDraft', {
+      'body': _currentDraft!.body,
+    });
+
+    _recordAction('Added to draft: "$additionalText"');
+    return 'Added to draft. Say "continue" to add more, "send" to send, or "cancel" to discard.';
+  }
+
+  Future<String> _sendDraft(Map<String, dynamic> input) async {
+    if (_currentDraft == null || _currentDraft!.isEmpty) {
+      return 'No draft to send.';
+    }
+
+    final draft = _currentDraft!;
+    bool success;
+
+    if (draft.isReply && draft.replyTo != null) {
+      // Send as reply
+      success = await _gmail.replyToEmail(draft.replyTo!, draft.body);
+      if (success) {
+        final senderName = _extractSenderName(draft.replyTo!.sender);
+        _currentDraft = null;
+        _onGuiUpdate?.call('clearDraft', null);
+        _recordAction('Sent reply to $senderName');
+        return 'Reply sent to $senderName.';
+      }
+    } else {
+      // Send as new email
+      final resolvedEmail = await _addressBook.resolveEmail(draft.to!);
+      if (resolvedEmail == null) {
+        return "Could not find contact '${draft.to}'. Add them to contacts or use their email address.";
+      }
+
+      success = await _gmail.sendEmail(
+        to: resolvedEmail,
+        subject: draft.subject!,
+        body: draft.body,
+      );
+
+      if (success) {
+        _currentDraft = null;
+        _onGuiUpdate?.call('clearDraft', null);
+        _recordAction('Sent email to ${draft.to}');
+        if (resolvedEmail != draft.to) {
+          return 'Sent to ${draft.to} ($resolvedEmail).';
+        }
+        return 'Sent to ${draft.to}.';
+      }
+    }
+
+    return 'Failed to send. Try again or say "cancel" to discard.';
+  }
+
+  Future<String> _cancelDraft(Map<String, dynamic> input) async {
+    if (_currentDraft == null || _currentDraft!.isEmpty) {
+      return 'No draft to cancel.';
+    }
+
+    _currentDraft = null;
+    _onGuiUpdate?.call('clearDraft', null);
+    _recordAction('Cancelled draft');
+    return 'Draft discarded.';
+  }
+
+  Future<String> _showDraft(Map<String, dynamic> input) async {
+    if (_currentDraft == null || _currentDraft!.isEmpty) {
+      return 'No draft in progress.';
+    }
+
+    final draft = _currentDraft!;
+    if (draft.isReply && draft.replyTo != null) {
+      return 'Reply to ${_extractSenderName(draft.replyTo!.sender)}: "${draft.body}". Say "continue" to add more, "send" to send, or "cancel".';
+    }
+    return 'Email to ${draft.to}, subject "${draft.subject}": "${draft.body}". Say "continue" to add more, "send" to send, or "cancel".';
+  }
 }

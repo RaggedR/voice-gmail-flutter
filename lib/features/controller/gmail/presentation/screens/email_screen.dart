@@ -9,25 +9,27 @@ import '../../../../../main.dart' show terminalCommandController;
 import '../../../../../core/constants/colors.dart';
 import '../../../../../core/constants/strings.dart';
 import '../../../agent/domain/email_agent.dart' show AgentContext, EmailAgent;
+import '../../../../voice/domain/voice_normalizer.dart';
 import '../widgets/email_content_view.dart';
 import '../widgets/email_list_item.dart';
 import 'pdf_viewer_screen.dart';
 
-/// Wake word variations (Deepgram often mishears "porcupine")
+/// Wake word
+const String kPrimaryWakeWord = 'jarvis';
+
+/// Wake word variations (common STT mishearings)
 const List<String> kWakeWords = [
-  'porcupine',
-  'pokepon',
-  'pokepun',
-  'poke upon',
-  'pokey pine',
-  'pokey pond',
-  'porky pine',
-  'pork you pine',
-  'okay pine',
-  'pope pine',
-  'poke a pine',
-  'poker pine',
+  'jarvis',
+  'jarves',
+  'jervis',
+  'jarvas',
+  'jarvus',
+  'service',  // common mishearing
+  'jar vis',
 ];
+
+/// Stop word to end conversation mode
+const String kStopWord = 'stop';
 
 /// Main email screen with Gmail-style two-panel layout
 class EmailScreen extends ConsumerStatefulWidget {
@@ -48,6 +50,11 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
   String? _lastCommand;
   DateTime? _lastCommandTime;
 
+  // Conversation mode - stays active after wake word for follow-up commands
+  bool _conversationModeActive = false;
+  Timer? _conversationTimer;
+  static const _conversationTimeoutSeconds = 15; // How long to stay active
+
   @override
   void initState() {
     super.initState();
@@ -64,11 +71,43 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
   @override
   void dispose() {
     _terminalSubscription?.cancel();
+    _conversationTimer?.cancel();
     _commandController.dispose();
     _commandFocus.dispose();
     _emailScrollController.dispose();
     _inboxScrollController.dispose();
     super.dispose();
+  }
+
+  /// Start or reset conversation mode timer
+  void _startConversationMode() {
+    _conversationTimer?.cancel();
+    _conversationModeActive = true;
+    ref.read(statusMessageProvider.notifier).state =
+        'Listening... (${_conversationTimeoutSeconds}s)';
+
+    _conversationTimer = Timer(
+      Duration(seconds: _conversationTimeoutSeconds),
+      () {
+        if (mounted) {
+          setState(() {
+            _conversationModeActive = false;
+          });
+          ref.read(statusMessageProvider.notifier).state =
+              'Say "$kPrimaryWakeWord" to start';
+          print('[Conversation] Mode ended - timeout');
+        }
+      },
+    );
+    print('[Conversation] Mode started/reset - ${_conversationTimeoutSeconds}s window');
+  }
+
+  /// End conversation mode immediately
+  void _endConversationMode() {
+    _conversationTimer?.cancel();
+    _conversationModeActive = false;
+    ref.read(statusMessageProvider.notifier).state = 'Say "$kPrimaryWakeWord" to start';
+    print('[Conversation] Mode ended manually');
   }
 
   Future<void> _initializeServices() async {
@@ -100,7 +139,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     final speech = ref.read(speechRecognizerProvider);
 
     ref.read(isListeningProvider.notifier).state = true;
-    ref.read(statusMessageProvider.notifier).state = 'Listening... say "Porcupine" + command';
+    ref.read(statusMessageProvider.notifier).state = 'Say "$kPrimaryWakeWord" + command';
 
     // Start continuous streaming - onResult called for each utterance
     print('[EmailScreen] Calling speech.startListening...');
@@ -111,17 +150,62 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         print('[STT] "$text"');
         final lowerText = text.toLowerCase();
 
-        // Find any wake word variation in the text
         String? command;
-        for (final wakeWord in kWakeWords) {
-          final idx = lowerText.indexOf(wakeWord);
-          if (idx >= 0) {
-            command = text.substring(idx + wakeWord.length).trim();
+
+        // Check for stop word to end conversation mode
+        // Match "stop", "stop.", "stop!" etc. but not "stop listening" (that's a command)
+        final cleanText = lowerText.replaceAll(RegExp(r'[^\w\s]'), '').trim();
+        if (_conversationModeActive && cleanText == kStopWord) {
+          print('[STT] Stop word detected');
+          _endConversationMode();
+          return;
+        }
+
+        // If conversation mode is active, treat entire text as command (no wake word needed)
+        if (_conversationModeActive) {
+          command = text.trim();
+          // Remove leading punctuation
+          while (command!.isNotEmpty && ',. !'.contains(command[0])) {
+            command = command.substring(1).trim();
+          }
+          print('[STT] Conversation mode - direct command: "$command"');
+        } else {
+          // Not in conversation mode - need wake word
+          int endIdx = -1;
+
+          // 1. Check explicit wake word list first (handles "pokemon", etc.)
+          for (final wakeWord in kWakeWords) {
+            final idx = lowerText.indexOf(wakeWord);
+            if (idx >= 0) {
+              endIdx = idx + wakeWord.length;
+              print('[STT] Explicit wake word match: "$wakeWord"');
+              break;
+            }
+          }
+
+          // 2. Fall back to fuzzy/phonetic matching for primary wake word
+          if (endIdx < 0) {
+            final wakeWordMatch = voiceNormalizer.findWakeWord(
+              text,
+              target: kPrimaryWakeWord,
+              cutoff: 55,
+            );
+            if (wakeWordMatch != null) {
+              final (matchedWord, _, matchEndIdx) = wakeWordMatch;
+              print('[STT] Fuzzy matched wake word: "$matchedWord"');
+              endIdx = matchEndIdx;
+            }
+          }
+
+          // Extract command after wake word
+          if (endIdx >= 0) {
+            command = text.substring(endIdx).trim();
             // Remove punctuation after wake word
             while (command!.isNotEmpty && ',. !'.contains(command[0])) {
               command = command.substring(1).trim();
             }
-            break;
+            // Wake word detected - start conversation mode
+            _startConversationMode();
           }
         }
 
@@ -129,6 +213,12 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
           print('[STT] Command: "$command"');
           // Show transcription in search bar
           _commandController.text = command;
+
+          // Reset conversation mode timer on each command
+          if (_conversationModeActive) {
+            _startConversationMode();
+          }
+
           // Feed into same stream as text commands from nc localhost 9999
           terminalCommandController.add(command);
         }
@@ -180,22 +270,31 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
 
     try {
 
+    // Normalize text for number homophones
+    final normalizedText = voiceNormalizer.normalize(lowerText);
+
     // SCROLL - handle locally for speed (no TTS, PDF viewer also listens)
-    if (lowerText.contains('down') || lowerText.contains('up')) {
-      final isDown = lowerText.contains('down');
-      final isUp = lowerText.contains('up');
+    // Use fuzzy matching for scroll commands: "scrawl down", "scrol up", etc.
+    final isScrollDown = voiceNormalizer.containsFuzzyMatch(normalizedText, ['down'], cutoff: 80) ||
+                         normalizedText.contains('down');
+    final isScrollUp = voiceNormalizer.containsFuzzyMatch(normalizedText, ['up'], cutoff: 80) ||
+                       normalizedText.contains('up');
+    final hasScrollWord = voiceNormalizer.containsFuzzyMatch(normalizedText, ['scroll'], cutoff: 70) ||
+                          normalizedText.contains('scroll');
+
+    if (hasScrollWord && (isScrollDown || isScrollUp)) {
       // Scroll the inbox list
       if (_inboxScrollController.hasClients) {
         final current = _inboxScrollController.offset;
         final max = _inboxScrollController.position.maxScrollExtent;
         final scrollAmount = 300.0;
-        if (isDown) {
+        if (isScrollDown) {
           _inboxScrollController.animateTo(
             (current + scrollAmount).clamp(0, max),
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
           );
-        } else if (isUp) {
+        } else if (isScrollUp) {
           _inboxScrollController.animateTo(
             (current - scrollAmount).clamp(0, max),
             duration: const Duration(milliseconds: 200),
@@ -206,14 +305,18 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
       response = null; // Silent - no TTS for scroll
     }
     // CLOSE - handle locally for PDF viewer
-    else if (lowerText.contains('close') || lowerText.contains('back')) {
+    else if (voiceNormalizer.containsFuzzyMatch(normalizedText, ['close', 'back'], cutoff: 75) ||
+             normalizedText.contains('close') || normalizedText.contains('back')) {
       // PDF viewer handles this via stream, but we stay silent
       response = null;
     }
     // OPEN ATTACHMENT - handle locally (needs Navigator)
-    // Match various transcriptions: attachment, attach, atach, atack, pdf
-    else if ((lowerText.contains('open') || lowerText.contains('view') || lowerText.contains('download') || lowerText.contains('show')) &&
-             (lowerText.contains('attach') || lowerText.contains('atach') || lowerText.contains('atack') || lowerText.contains('pdf'))) {
+    // Use fuzzy matching for attachment commands: "atach", "attatch", etc.
+    else if ((voiceNormalizer.containsFuzzyMatch(normalizedText, ['open', 'view', 'download', 'show'], cutoff: 75) ||
+              normalizedText.contains('open') || normalizedText.contains('view') ||
+              normalizedText.contains('download') || normalizedText.contains('show')) &&
+             (voiceNormalizer.containsFuzzyMatch(normalizedText, ['attachment', 'pdf'], cutoff: 70) ||
+              normalizedText.contains('attach') || normalizedText.contains('pdf'))) {
       print('[CMD] Matched attachment command');
       final gmail = ref.read(gmailRepositoryProvider);
       final selectedEmail = ref.read(selectedEmailProvider);
@@ -225,7 +328,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
       } else {
         // Find which attachment to open (default to first, or first PDF if mentioned)
         int attachmentIndex = 0;
-        if (lowerText.contains('pdf')) {
+        if (normalizedText.contains('pdf')) {
           final pdfIdx = selectedEmail.attachments.indexWhere((a) => a.mimeType.contains('pdf'));
           if (pdfIdx >= 0) attachmentIndex = pdfIdx;
         }

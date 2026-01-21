@@ -296,5 +296,101 @@ const List<Map<String, dynamic>> gmailTools = [
       'properties': {},
       'required': []
     }
+  },
+  {
+    'name': 'next_email',
+    'description': 'Open the next email in the list. Use during inbox triage when user says "next", "next one", "next email".',
+    'input_schema': {
+      'type': 'object',
+      'properties': {},
+      'required': []
+    }
+  },
+  {
+    'name': 'previous_email',
+    'description': 'Open the previous email in the list. Use when user says "previous", "go back", "last one".',
+    'input_schema': {
+      'type': 'object',
+      'properties': {},
+      'required': []
+    }
+  },
+  // Draft email tools for compose workflow
+  {
+    'name': 'draft_email',
+    'description': 'Start composing a new email draft. ALWAYS use this instead of send_email. User must confirm before sending.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {
+        'to': {
+          'type': 'string',
+          'description': 'Recipient - can be contact name or email address'
+        },
+        'subject': {
+          'type': 'string',
+          'description': 'Email subject line'
+        },
+        'body': {
+          'type': 'string',
+          'description': 'Initial message body. Can be added to later with continue_draft.'
+        }
+      },
+      'required': ['to', 'subject']
+    }
+  },
+  {
+    'name': 'draft_reply',
+    'description': 'Start composing a reply to the currently selected email. User must confirm before sending.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {
+        'body': {
+          'type': 'string',
+          'description': 'Initial reply message. Can be added to later with continue_draft.'
+        }
+      },
+      'required': []
+    }
+  },
+  {
+    'name': 'continue_draft',
+    'description': 'Add more content to the current email draft. Use when user says "continue" and dictates more message content.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {
+        'additional_text': {
+          'type': 'string',
+          'description': 'Text to append to the draft body'
+        }
+      },
+      'required': ['additional_text']
+    }
+  },
+  {
+    'name': 'send_draft',
+    'description': 'Send the current draft email. Use when user confirms they want to send (says "send", "send it", "yes send", etc).',
+    'input_schema': {
+      'type': 'object',
+      'properties': {},
+      'required': []
+    }
+  },
+  {
+    'name': 'cancel_draft',
+    'description': 'Discard the current draft without sending. Use when user says "cancel", "nevermind", "discard", etc.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {},
+      'required': []
+    }
+  },
+  {
+    'name': 'show_draft',
+    'description': 'Show the current draft status - who it is to, subject, and body so far.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {},
+      'required': []
+    }
   }
 ];

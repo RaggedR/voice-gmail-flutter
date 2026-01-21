@@ -3,6 +3,20 @@ import 'package:flutter/material.dart';
 import '../../../../../core/constants/colors.dart';
 import '../../data/email_model.dart';
 
+/// Labels to hide from display (system labels)
+const _hiddenLabels = {
+  'INBOX', 'SENT', 'DRAFT', 'SPAM', 'TRASH', 'UNREAD',
+  'CATEGORY_PERSONAL', 'CATEGORY_SOCIAL', 'CATEGORY_PROMOTIONS',
+  'CATEGORY_UPDATES', 'CATEGORY_FORUMS',
+};
+
+/// Label display colors
+const _labelColors = {
+  'IMPORTANT': Color(0xFFD93025),
+  'STARRED': Color(0xFFF4B400),
+  'CATEGORY_PRIMARY': Color(0xFF1A73E8),
+};
+
 /// Gmail-style email list item widget
 class EmailListItem extends StatefulWidget {
   final Email email;
@@ -24,6 +38,57 @@ class EmailListItem extends StatefulWidget {
 
 class _EmailListItemState extends State<EmailListItem> {
   bool _isHovered = false;
+
+  /// Build label chips for visible labels
+  List<Widget> _buildLabelChips() {
+    final visibleLabels = widget.email.labelIds
+        .where((label) => !_hiddenLabels.contains(label))
+        .take(2) // Show max 2 labels
+        .toList();
+
+    if (visibleLabels.isEmpty) return [];
+
+    return visibleLabels.map((label) {
+      final color = _labelColors[label] ?? GmailColors.textSecondary;
+      final displayName = _formatLabelName(label);
+
+      return Padding(
+        padding: const EdgeInsets.only(left: 4),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(3),
+            border: Border.all(color: color.withValues(alpha: 0.3), width: 0.5),
+          ),
+          child: Text(
+            displayName,
+            style: TextStyle(
+              fontSize: 9,
+              color: color,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  /// Format label ID to display name
+  String _formatLabelName(String label) {
+    // Handle common labels
+    if (label == 'IMPORTANT') return 'Important';
+    if (label == 'STARRED') return '★';
+    if (label == 'CATEGORY_PRIMARY') return 'Primary';
+
+    // Handle custom labels (Label_xxx format)
+    if (label.startsWith('Label_')) {
+      return label.substring(6);
+    }
+
+    // Capitalize first letter, lowercase rest
+    return label[0].toUpperCase() + label.substring(1).toLowerCase();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -81,17 +146,25 @@ class _EmailListItemState extends State<EmailListItem> {
                       ),
                     ),
                     const SizedBox(height: 2),
-                    // Subject
-                    Text(
-                      preview.subject.length > 50
-                          ? '${preview.subject.substring(0, 50)}...'
-                          : preview.subject,
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: fontWeight,
-                        color: GmailColors.text,
-                      ),
-                      overflow: TextOverflow.ellipsis,
+                    // Subject + Labels row
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            preview.subject.length > 40
+                                ? '${preview.subject.substring(0, 40)}...'
+                                : preview.subject,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: fontWeight,
+                              color: GmailColors.text,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        // Labels
+                        ..._buildLabelChips(),
+                      ],
                     ),
                     const SizedBox(height: 2),
                     // Snippet
