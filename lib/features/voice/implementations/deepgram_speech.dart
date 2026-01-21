@@ -25,6 +25,7 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
 
   // Transcript accumulation
   String _currentTranscript = '';
+  List<String> _alternativeTranscripts = []; // N-best alternatives
   Timer? _silenceTimer;
   Timer? _keepAliveTimer;
   DateTime? _lastTranscriptTime;
@@ -116,12 +117,13 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
     _onError = onError;
     _onDone = onDone;
     _currentTranscript = '';
+    _alternativeTranscripts = [];
     _isListening = true;
 
     try {
       print('[Deepgram] Connecting to WebSocket...');
       _webSocket = await WebSocket.connect(
-        'wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2&language=en-US&punctuate=true&interim_results=true&endpointing=1000&utterance_end_ms=2000&vad_events=true',
+        'wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2&language=en-US&punctuate=true&interim_results=true&endpointing=1000&utterance_end_ms=2000&vad_events=true&alternatives=3',
         headers: {'Authorization': 'Token $_apiKey'},
       );
 
@@ -264,14 +266,33 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
       final isFinal = json['is_final'] as bool? ?? false;
       final speechFinal = json['speech_final'] as bool? ?? false;
 
+      // Extract all alternatives (N-best hypotheses)
+      final alternatives = <String>[];
+      for (final alt in alternativesRaw) {
+        if (alt is Map<String, dynamic>) {
+          final altTranscript = alt['transcript'] as String?;
+          if (altTranscript != null && altTranscript.isNotEmpty) {
+            alternatives.add(altTranscript);
+          }
+        }
+      }
+
       // Log all transcripts including empty ones
       if (transcript != null && transcript.isNotEmpty) {
-        print('[Deepgram] transcript: "$transcript" (isFinal=$isFinal, speechFinal=$speechFinal)');
+        final altInfo = alternatives.length > 1 ? ' (${alternatives.length} alternatives)' : '';
+        print('[Deepgram] transcript: "$transcript"$altInfo (isFinal=$isFinal, speechFinal=$speechFinal)');
       }
 
       if (transcript != null && transcript.isNotEmpty) {
         _lastTranscriptTime = DateTime.now();
         _currentTranscript += (transcript + ' ');
+
+        // Store alternatives (keep unique ones only)
+        for (final alt in alternatives.skip(1)) { // Skip first, it's the primary
+          if (!_alternativeTranscripts.contains(alt) && alt != transcript) {
+            _alternativeTranscripts.add(alt);
+          }
+        }
 
         // Reset silence timer - wait for more speech or deliver after timeout
         _silenceTimer?.cancel();
@@ -296,12 +317,27 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
   void _deliverTranscript() {
     _silenceTimer?.cancel();
     if (_currentTranscript.trim().isNotEmpty) {
-      final finalText = _currentTranscript.trim();
-      print('\n========================================');
-      print('YOU SAID: "$finalText"');
-      print('========================================\n');
+      final primaryText = _currentTranscript.trim();
+
+      // Build output with alternatives for Claude
+      String finalText = primaryText;
+      if (_alternativeTranscripts.isNotEmpty) {
+        // Limit to 2 alternatives to avoid overwhelming Claude
+        final alts = _alternativeTranscripts.take(2).toList();
+        finalText = '$primaryText [ALT: ${alts.join(" | ")}]';
+        print('\n========================================');
+        print('YOU SAID: "$primaryText"');
+        print('ALTERNATIVES: ${alts.join(", ")}');
+        print('========================================\n');
+      } else {
+        print('\n========================================');
+        print('YOU SAID: "$primaryText"');
+        print('========================================\n');
+      }
+
       _onResult?.call(finalText);
       _currentTranscript = '';
+      _alternativeTranscripts = [];
     }
   }
 

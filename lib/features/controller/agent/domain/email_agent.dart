@@ -31,6 +31,8 @@ When viewing PDFs:
 Before choosing a tool, pause and reason through:
 
 1. **WHAT did they likely say?** Speech-to-text is unreliable. The transcription you receive is often wrong.
+   - The input may include `[ALT: ...]` with alternative interpretations - USE THESE!
+   - Example: "delayed amen [ALT: delete email | the late amen]" → they said "delete email"
    - Numbers become homophones: "to/too/two"→2, "for/four"→4, "won/one"→1, "ate/eight"→8
    - Names get mangled: "John"→"Jon"/"Juan", "Sarah"→"Sara"/"Sera"
    - Commands get garbled: "delete"→"delayed"/"the lead", "inbox"→"in box"/"inebo", "email"→"amen"/"a male"

@@ -10,6 +10,7 @@ import '../../../../../core/constants/colors.dart';
 import '../../../../../core/constants/strings.dart';
 import '../../../agent/domain/email_agent.dart' show AgentContext, EmailAgent;
 import '../../../../voice/domain/voice_normalizer.dart';
+import '../../../../voice/domain/correction_learner.dart';
 import '../widgets/email_content_view.dart';
 import '../widgets/email_list_item.dart';
 import 'pdf_viewer_screen.dart';
@@ -54,6 +55,9 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
   bool _conversationModeActive = false;
   Timer? _conversationTimer;
   static const _conversationTimeoutSeconds = 15; // How long to stay active
+
+  // Correction learning - learns from user repetitions/corrections
+  final CorrectionLearner _correctionLearner = CorrectionLearner();
 
   @override
   void initState() {
@@ -365,6 +369,12 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     else {
       final agent = ref.read(emailAgentProvider);
 
+      // Apply learned corrections before sending to Claude
+      final correctedText = await _correctionLearner.processCommand(text, wasSuccessful: false);
+      if (correctedText != text) {
+        print('[CMD] Applied correction: "$text" → "$correctedText"');
+      }
+
       // Build context from current state
       final context = AgentContext(
         currentEmail: ref.read(selectedEmailProvider),
@@ -373,8 +383,14 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         currentFolder: ref.read(currentFolderProvider),
       );
 
-      response = await agent.process(text, context: context);
+      response = await agent.process(correctedText, context: context);
       print('[CMD] Claude response: "$response"');
+
+      // If Claude executed a tool (empty response), mark command as successful
+      // This helps the learner detect when a rephrasing was understood
+      if (response == null || response.isEmpty) {
+        _correctionLearner.markLastCommandSuccessful();
+      }
 
       // Handle GUI updates from agent (email list, selected email, etc.)
       _syncAgentState(agent);
