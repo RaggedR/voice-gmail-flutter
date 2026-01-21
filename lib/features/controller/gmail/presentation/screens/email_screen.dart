@@ -11,6 +11,7 @@ import '../../../../../core/constants/strings.dart';
 import '../../../agent/domain/email_agent.dart' show AgentContext, EmailAgent;
 import '../../../../voice/domain/voice_normalizer.dart';
 import '../../../../voice/domain/correction_learner.dart';
+import '../../../../voice/domain/command_matcher.dart';
 import '../widgets/email_content_view.dart';
 import '../widgets/email_list_item.dart';
 import 'pdf_viewer_screen.dart';
@@ -58,6 +59,9 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
 
   // Correction learning - learns from user repetitions/corrections
   final CorrectionLearner _correctionLearner = CorrectionLearner();
+
+  // Command matching - matches transcriptions to known commands
+  final CommandMatcher _commandMatcher = CommandMatcher();
 
   @override
   void initState() {
@@ -365,35 +369,51 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         response = null; // Silent - action is obvious
       }
     }
-    // EVERYTHING ELSE - send to Claude with context
+    // TRY COMMAND MATCHER FIRST - fast local matching
     else {
-      final agent = ref.read(emailAgentProvider);
+      final match = _commandMatcher.match(normalizedText);
 
-      // Apply learned corrections before sending to Claude
-      final correctedText = await _correctionLearner.processCommand(text, wasSuccessful: false);
-      if (correctedText != text) {
-        print('[CMD] Applied correction: "$text" → "$correctedText"');
-      }
-
-      // Build context from current state
-      final context = AgentContext(
-        currentEmail: ref.read(selectedEmailProvider),
-        selectedIndex: ref.read(selectedEmailIndexProvider),
-        emailList: ref.read(currentEmailsProvider),
-        currentFolder: ref.read(currentFolderProvider),
-      );
-
-      response = await agent.process(correctedText, context: context);
-      print('[CMD] Claude response: "$response"');
-
-      // If Claude executed a tool (empty response), mark command as successful
-      // This helps the learner detect when a rephrasing was understood
-      if (response == null || response.isEmpty) {
+      if (match != null && match.isConfident) {
+        // High confidence match - execute directly without Claude
+        print('[CMD] Matched: ${match.command} (${match.confidence}%) args=${match.args}');
+        response = await _executeMatchedCommand(match);
         _correctionLearner.markLastCommandSuccessful();
-      }
+      } else {
+        // Low confidence or no match - fall back to Claude
+        if (match != null) {
+          print('[CMD] Low confidence match: ${match.command} (${match.confidence}%) - using Claude');
+        } else {
+          print('[CMD] No match - using Claude');
+        }
 
-      // Handle GUI updates from agent (email list, selected email, etc.)
-      _syncAgentState(agent);
+        final agent = ref.read(emailAgentProvider);
+
+        // Apply learned corrections before sending to Claude
+        final correctedText = await _correctionLearner.processCommand(text, wasSuccessful: false);
+        if (correctedText != text) {
+          print('[CMD] Applied correction: "$text" → "$correctedText"');
+        }
+
+        // Build context from current state
+        final context = AgentContext(
+          currentEmail: ref.read(selectedEmailProvider),
+          selectedIndex: ref.read(selectedEmailIndexProvider),
+          emailList: ref.read(currentEmailsProvider),
+          currentFolder: ref.read(currentFolderProvider),
+        );
+
+        response = await agent.process(correctedText, context: context);
+        print('[CMD] Claude response: "$response"');
+
+        // If Claude executed a tool (empty response), mark command as successful
+        // This helps the learner detect when a rephrasing was understood
+        if (response == null || response.isEmpty) {
+          _correctionLearner.markLastCommandSuccessful();
+        }
+
+        // Handle GUI updates from agent (email list, selected email, etc.)
+        _syncAgentState(agent);
+      }
     }
 
     ref.read(isProcessingProvider.notifier).state = false;
@@ -429,6 +449,269 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         // Restart listening after error
         _startListening();
       }
+    }
+  }
+
+  /// Execute a matched command directly (bypassing Claude)
+  Future<String?> _executeMatchedCommand(CommandMatch match) async {
+    final gmail = ref.read(gmailRepositoryProvider);
+    final agent = ref.read(emailAgentProvider);
+    final emails = ref.read(currentEmailsProvider);
+    final selectedEmail = ref.read(selectedEmailProvider);
+    final selectedIndex = ref.read(selectedEmailIndexProvider);
+
+    switch (match.command) {
+      // === INBOX NAVIGATION ===
+      case 'show_inbox':
+        await agent.process('list_emails folder:inbox', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_unread':
+        await agent.process('list_unread_emails', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_sent':
+        await agent.process('list_emails folder:sent', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_drafts':
+        await agent.process('list_emails folder:drafts', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_starred':
+        await agent.process('list_emails folder:starred', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_spam':
+        await agent.process('list_emails folder:spam', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'show_trash':
+        await agent.process('list_emails folder:trash', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      case 'check_inbox':
+        final unread = await gmail.getUnreadCount();
+        final total = await gmail.getInboxCount();
+        return '$unread unread of $total.';
+
+      case 'refresh':
+        await agent.process('list_emails', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      // === EMAIL SELECTION ===
+      case 'open_email':
+        final number = match.args['number'] as int?;
+        if (number != null && number > 0 && number <= emails.length) {
+          final email = emails[number - 1];
+          final fullEmail = await gmail.getEmail(email.id, includeBody: true);
+          if (fullEmail != null) {
+            ref.read(selectedEmailProvider.notifier).state = fullEmail;
+            ref.read(selectedEmailIndexProvider.notifier).state = number - 1;
+            await gmail.markAsRead(email.id);
+            return null;
+          }
+        }
+        return 'Invalid email number.';
+
+      case 'next_email':
+        if (emails.isEmpty) return 'No emails.';
+        final nextIdx = (selectedIndex ?? -1) + 1;
+        if (nextIdx >= emails.length) return 'Last email.';
+        final email = emails[nextIdx];
+        final fullEmail = await gmail.getEmail(email.id, includeBody: true);
+        if (fullEmail != null) {
+          ref.read(selectedEmailProvider.notifier).state = fullEmail;
+          ref.read(selectedEmailIndexProvider.notifier).state = nextIdx;
+          await gmail.markAsRead(email.id);
+        }
+        return null;
+
+      case 'previous_email':
+        if (emails.isEmpty) return 'No emails.';
+        final prevIdx = (selectedIndex ?? 1) - 1;
+        if (prevIdx < 0) return 'First email.';
+        final email = emails[prevIdx];
+        final fullEmail = await gmail.getEmail(email.id, includeBody: true);
+        if (fullEmail != null) {
+          ref.read(selectedEmailProvider.notifier).state = fullEmail;
+          ref.read(selectedEmailIndexProvider.notifier).state = prevIdx;
+          await gmail.markAsRead(email.id);
+        }
+        return null;
+
+      case 'first_email':
+        if (emails.isEmpty) return 'No emails.';
+        final email = emails[0];
+        final fullEmail = await gmail.getEmail(email.id, includeBody: true);
+        if (fullEmail != null) {
+          ref.read(selectedEmailProvider.notifier).state = fullEmail;
+          ref.read(selectedEmailIndexProvider.notifier).state = 0;
+          await gmail.markAsRead(email.id);
+        }
+        return null;
+
+      case 'last_email':
+        if (emails.isEmpty) return 'No emails.';
+        final lastIdx = emails.length - 1;
+        final email = emails[lastIdx];
+        final fullEmail = await gmail.getEmail(email.id, includeBody: true);
+        if (fullEmail != null) {
+          ref.read(selectedEmailProvider.notifier).state = fullEmail;
+          ref.read(selectedEmailIndexProvider.notifier).state = lastIdx;
+          await gmail.markAsRead(email.id);
+        }
+        return null;
+
+      // === EMAIL ACTIONS ===
+      case 'delete':
+        if (selectedEmail == null || selectedIndex == null) return 'No email selected.';
+        await gmail.deleteEmail(selectedEmail.id);
+        final newEmails = List.of(emails)..removeAt(selectedIndex);
+        ref.read(currentEmailsProvider.notifier).state = newEmails;
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = null;
+        return 'Deleted.';
+
+      case 'delete_email':
+        final number = match.args['number'] as int?;
+        if (number == null || number < 1 || number > emails.length) return 'Invalid number.';
+        final email = emails[number - 1];
+        await gmail.deleteEmail(email.id);
+        final newEmails = List.of(emails)..removeAt(number - 1);
+        ref.read(currentEmailsProvider.notifier).state = newEmails;
+        if (selectedIndex == number - 1) {
+          ref.read(selectedEmailProvider.notifier).state = null;
+          ref.read(selectedEmailIndexProvider.notifier).state = null;
+        }
+        return 'Deleted.';
+
+      case 'archive':
+        if (selectedEmail == null || selectedIndex == null) return 'No email selected.';
+        await gmail.archiveEmail(selectedEmail.id);
+        final newEmails = List.of(emails)..removeAt(selectedIndex);
+        ref.read(currentEmailsProvider.notifier).state = newEmails;
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = null;
+        return 'Archived.';
+
+      case 'archive_email':
+        final number = match.args['number'] as int?;
+        if (number == null || number < 1 || number > emails.length) return 'Invalid number.';
+        final email = emails[number - 1];
+        await gmail.archiveEmail(email.id);
+        final newEmails = List.of(emails)..removeAt(number - 1);
+        ref.read(currentEmailsProvider.notifier).state = newEmails;
+        if (selectedIndex == number - 1) {
+          ref.read(selectedEmailProvider.notifier).state = null;
+          ref.read(selectedEmailIndexProvider.notifier).state = null;
+        }
+        return 'Archived.';
+
+      case 'star':
+        if (selectedEmail == null) return 'No email selected.';
+        await gmail.applyLabel(selectedEmail.id, 'STARRED');
+        return 'Starred.';
+
+      case 'unstar':
+        if (selectedEmail == null) return 'No email selected.';
+        await gmail.removeLabel(selectedEmail.id, 'STARRED');
+        return 'Unstarred.';
+
+      // === LABELS ===
+      case 'label':
+        if (selectedEmail == null) return 'No email selected.';
+        final labelName = match.args['text'] as String?;
+        if (labelName == null || labelName.isEmpty) return 'Which label?';
+        await gmail.applyLabel(selectedEmail.id, labelName);
+        return 'Labeled $labelName.';
+
+      case 'remove_label':
+        if (selectedEmail == null) return 'No email selected.';
+        final labelName = match.args['text'] as String?;
+        if (labelName == null || labelName.isEmpty) return 'Which label?';
+        await gmail.removeLabel(selectedEmail.id, labelName);
+        return 'Removed $labelName.';
+
+      case 'show_labels':
+        final labels = await gmail.listLabels();
+        final userLabels = labels.where((l) => !l.id.startsWith('CATEGORY_')).toList();
+        return '${userLabels.length} labels: ${userLabels.take(5).map((l) => l.name).join(", ")}...';
+
+      // === SEARCH ===
+      case 'search':
+        final query = match.args['text'] as String?;
+        if (query == null || query.isEmpty) return 'Search for what?';
+        final results = await gmail.searchEmails(query);
+        ref.read(currentEmailsProvider.notifier).state = results;
+        return 'Found ${results.length}.';
+
+      case 'from':
+        final name = match.args['text'] as String?;
+        if (name == null || name.isEmpty) return 'From who?';
+        final results = await gmail.searchEmails('from:$name');
+        ref.read(currentEmailsProvider.notifier).state = results;
+        return 'Found ${results.length} from $name.';
+
+      // === ATTACHMENTS ===
+      case 'open_attachment':
+        if (selectedEmail == null) return 'No email selected.';
+        if (selectedEmail.attachments.isEmpty) return 'No attachments.';
+        final idx = (match.args['number'] as int? ?? 1) - 1;
+        if (idx < 0 || idx >= selectedEmail.attachments.length) return 'Invalid attachment.';
+        await _openAttachmentByIndex(idx + 1);
+        return null;
+
+      case 'open_pdf':
+        if (selectedEmail == null) return 'No email selected.';
+        final pdfIdx = selectedEmail.attachments.indexWhere((a) => a.mimeType.contains('pdf'));
+        if (pdfIdx < 0) return 'No PDF attachment.';
+        await _openAttachmentByIndex(pdfIdx + 1);
+        return null;
+
+      // === PDF VIEWER (handled by PDF viewer itself via stream) ===
+      case 'scroll_down':
+      case 'scroll_up':
+      case 'next_page':
+      case 'previous_page':
+      case 'first_page':
+      case 'last_page':
+      case 'zoom_in':
+      case 'zoom_out':
+      case 'close':
+        // These are handled by PDF viewer listening to the command stream
+        return null;
+
+      case 'page':
+        // Page number command - PDF viewer handles via stream
+        return null;
+
+      // === PAGINATION ===
+      case 'more':
+        await agent.process('next_page', context: null);
+        _syncAgentState(agent);
+        return null;
+
+      // === SYSTEM ===
+      case 'stop':
+        _conversationModeActive = false;
+        _conversationTimer?.cancel();
+        return 'Stopped.';
+
+      case 'help':
+        return 'Say: show inbox, read email 1, delete, archive, next, open attachment.';
+
+      default:
+        // Unknown command - let Claude handle it
+        return null;
     }
   }
 
