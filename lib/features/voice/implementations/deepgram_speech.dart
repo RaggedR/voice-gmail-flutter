@@ -18,6 +18,41 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
   bool _isListening = false;
   bool _isInitialized = false;
 
+  // Keywords to boost for better command recognition
+  // Format: word:intensifier (1.0 = default, 2.0 = strong boost)
+  static const List<String> _boostKeywords = [
+    // Wake words - strong boost
+    'jarvis:2', 'davis:1.5', 'travis:1.5',
+    // Navigation commands
+    'inbox:1.5', 'email:1.5', 'emails:1.5', 'unread:1.5', 'sent:1.3',
+    'drafts:1.5', 'starred:1.5', 'spam:1.3', 'trash:1.3', 'refresh:1.3',
+    // Actions - strong boost for common commands
+    'delete:1.8', 'archive:1.8', 'next:1.5', 'previous:1.5',
+    'open:1.5', 'close:1.5', 'send:1.8', 'cancel:1.5',
+    // Email actions
+    'reply:1.5', 'forward:1.5', 'compose:1.5', 'message:1.3',
+    // Reading/selection
+    'read:1.3', 'first:1.3', 'last:1.3', 'show:1.3',
+    // Attachments & PDF
+    'attachment:1.8', 'pdf:1.5', 'scroll:1.5', 'page:1.5',
+    'down:1.3', 'up:1.3', 'zoom:1.3',
+    // Labels
+    'label:1.5', 'labels:1.3',
+    // Search
+    'search:1.5', 'find:1.3', 'from:1.3',
+    // Contacts
+    'contact:1.5', 'contacts:1.3',
+    // Star
+    'star:1.5', 'unstar:1.3',
+    // System
+    'stop:1.3', 'help:1.3', 'more:1.3', 'back:1.3',
+  ];
+
+  String get _keywordsParam {
+    // URL encode the keywords parameter
+    return _boostKeywords.join(',');
+  }
+
   // Callbacks
   void Function(String text)? _onResult;
   void Function(String error)? _onError;
@@ -122,13 +157,20 @@ class DeepgramSpeechRecognizer implements SpeechRecognizer {
 
     try {
       print('[Deepgram] Connecting to WebSocket...');
+      final url = 'wss://api.deepgram.com/v1/listen?'
+          'encoding=linear16&sample_rate=16000&channels=1'
+          '&model=nova-2&language=en-US'
+          '&punctuate=true&interim_results=true'
+          '&endpointing=300&utterance_end_ms=1500&vad_events=true'
+          '&keywords=${Uri.encodeComponent(_keywordsParam)}';
+      print('[Deepgram] Using ${_boostKeywords.length} boosted keywords');
       _webSocket = await WebSocket.connect(
-        'wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2&language=en-US&punctuate=true&interim_results=true&endpointing=1000&utterance_end_ms=2000&vad_events=true&alternatives=3',
+        url,
         headers: {'Authorization': 'Token $_apiKey'},
       );
 
       print('[Deepgram] WebSocket CONNECTED!');
-      print('\n[Listening... say "Porcupine" + command]\n');
+      print('\n[Listening... say "Jarvis" + command]\n');
 
       // Send keepalive pings every 8 seconds to prevent timeout
       // Deepgram expects {"type": "KeepAlive"} JSON message

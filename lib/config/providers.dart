@@ -11,6 +11,7 @@ import '../features/voice/domain/speech_recognizer.dart';
 import '../features/voice/domain/wake_word_service.dart';
 import '../features/voice/implementations/deepgram_speech.dart';
 import '../features/voice/implementations/platform_speech.dart';
+import '../features/voice/implementations/vosk_speech.dart';
 import '../features/tts/tts_service.dart';
 
 // ============================================
@@ -62,12 +63,18 @@ final statusMessageProvider = StateProvider<String>((ref) => 'Listening for voic
 // ============================================
 
 /// Speech recognizer provider
+/// Set STT_ENGINE in .env: 'vosk', 'deepgram', or 'platform'
 final speechRecognizerProvider = Provider<SpeechRecognizer>((ref) {
   final engine = dotenv.env['STT_ENGINE'] ?? 'platform';
-  if (engine == 'deepgram') {
-    return DeepgramSpeechRecognizer();
+  switch (engine) {
+    case 'vosk':
+      // Requires: python vosk_server/server.py
+      return VoskSpeechRecognizer();
+    case 'deepgram':
+      return DeepgramSpeechRecognizer();
+    default:
+      return PlatformSpeechRecognizer();
   }
-  return PlatformSpeechRecognizer();
 });
 
 /// Whether speech recognition is listening

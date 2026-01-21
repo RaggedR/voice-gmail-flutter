@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app.dart';
@@ -16,6 +17,9 @@ Future<void> main() async {
 
   // Load environment variables
   await dotenv.load(fileName: '.env');
+
+  // Initialize Hive for local storage (corrections, etc.)
+  await Hive.initFlutter();
 
   // Listen for terminal input (stdin)
   _startTerminalInput();

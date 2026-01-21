@@ -8,7 +8,7 @@ import '../../../../../config/providers.dart';
 import '../../../../../main.dart' show terminalCommandController;
 import '../../../../../core/constants/colors.dart';
 import '../../../../../core/constants/strings.dart';
-import '../../../agent/domain/email_agent.dart' show AgentContext, EmailAgent;
+// Note: EmailAgent no longer used - all commands execute directly via Gmail API
 import '../../../../voice/domain/voice_normalizer.dart';
 import '../../../../voice/domain/correction_learner.dart';
 import '../../../../voice/domain/command_matcher.dart';
@@ -373,46 +373,19 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     else {
       final match = _commandMatcher.match(normalizedText);
 
-      if (match != null && match.isConfident) {
-        // High confidence match - execute directly without Claude
+      if (match != null && match.confidence >= 50) {
+        // Match found - execute directly without Claude
         print('[CMD] Matched: ${match.command} (${match.confidence}%) args=${match.args}');
         response = await _executeMatchedCommand(match);
         _correctionLearner.markLastCommandSuccessful();
       } else {
-        // Low confidence or no match - fall back to Claude
+        // No match or very low confidence - don't use Claude, just report
         if (match != null) {
-          print('[CMD] Low confidence match: ${match.command} (${match.confidence}%) - using Claude');
+          print('[CMD] Very low confidence match: ${match.command} (${match.confidence}%) - ignoring');
         } else {
-          print('[CMD] No match - using Claude');
+          print('[CMD] No match found');
         }
-
-        final agent = ref.read(emailAgentProvider);
-
-        // Apply learned corrections before sending to Claude
-        final correctedText = await _correctionLearner.processCommand(text, wasSuccessful: false);
-        if (correctedText != text) {
-          print('[CMD] Applied correction: "$text" → "$correctedText"');
-        }
-
-        // Build context from current state
-        final context = AgentContext(
-          currentEmail: ref.read(selectedEmailProvider),
-          selectedIndex: ref.read(selectedEmailIndexProvider),
-          emailList: ref.read(currentEmailsProvider),
-          currentFolder: ref.read(currentFolderProvider),
-        );
-
-        response = await agent.process(correctedText, context: context);
-        print('[CMD] Claude response: "$response"');
-
-        // If Claude executed a tool (empty response), mark command as successful
-        // This helps the learner detect when a rephrasing was understood
-        if (response == null || response.isEmpty) {
-          _correctionLearner.markLastCommandSuccessful();
-        }
-
-        // Handle GUI updates from agent (email list, selected email, etc.)
-        _syncAgentState(agent);
+        response = 'Command not recognized. Try: show inbox, delete, archive, next, previous, scroll down.';
       }
     }
 
@@ -452,50 +425,70 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
     }
   }
 
-  /// Execute a matched command directly (bypassing Claude)
+  /// Execute a matched command directly (no Claude API calls)
   Future<String?> _executeMatchedCommand(CommandMatch match) async {
     final gmail = ref.read(gmailRepositoryProvider);
-    final agent = ref.read(emailAgentProvider);
     final emails = ref.read(currentEmailsProvider);
     final selectedEmail = ref.read(selectedEmailProvider);
     final selectedIndex = ref.read(selectedEmailIndexProvider);
 
     switch (match.command) {
-      // === INBOX NAVIGATION ===
+      // === INBOX NAVIGATION (no Claude needed) ===
       case 'show_inbox':
-        await agent.process('list_emails folder:inbox', context: null);
-        _syncAgentState(agent);
-        return null;
+        final inboxEmails = await gmail.listEmails(query: 'in:inbox', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = inboxEmails;
+        ref.read(currentFolderProvider.notifier).state = 'inbox';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${inboxEmails.length} emails.';
 
       case 'show_unread':
-        await agent.process('list_unread_emails', context: null);
-        _syncAgentState(agent);
-        return null;
+        final unreadEmails = await gmail.listEmails(query: 'is:unread in:inbox', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = unreadEmails;
+        ref.read(currentFolderProvider.notifier).state = 'unread';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${unreadEmails.length} unread.';
 
       case 'show_sent':
-        await agent.process('list_emails folder:sent', context: null);
-        _syncAgentState(agent);
-        return null;
+        final sentEmails = await gmail.listEmails(query: 'in:sent', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = sentEmails;
+        ref.read(currentFolderProvider.notifier).state = 'sent';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${sentEmails.length} sent.';
 
       case 'show_drafts':
-        await agent.process('list_emails folder:drafts', context: null);
-        _syncAgentState(agent);
-        return null;
+        final draftEmails = await gmail.listEmails(query: 'in:drafts', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = draftEmails;
+        ref.read(currentFolderProvider.notifier).state = 'drafts';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${draftEmails.length} drafts.';
 
       case 'show_starred':
-        await agent.process('list_emails folder:starred', context: null);
-        _syncAgentState(agent);
-        return null;
+        final starredEmails = await gmail.listEmails(query: 'is:starred', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = starredEmails;
+        ref.read(currentFolderProvider.notifier).state = 'starred';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${starredEmails.length} starred.';
 
       case 'show_spam':
-        await agent.process('list_emails folder:spam', context: null);
-        _syncAgentState(agent);
-        return null;
+        final spamEmails = await gmail.listEmails(query: 'in:spam', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = spamEmails;
+        ref.read(currentFolderProvider.notifier).state = 'spam';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${spamEmails.length} spam.';
 
       case 'show_trash':
-        await agent.process('list_emails folder:trash', context: null);
-        _syncAgentState(agent);
-        return null;
+        final trashEmails = await gmail.listEmails(query: 'in:trash', maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = trashEmails;
+        ref.read(currentFolderProvider.notifier).state = 'trash';
+        ref.read(selectedEmailProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
+        return '${trashEmails.length} trash.';
 
       case 'check_inbox':
         final unread = await gmail.getUnreadCount();
@@ -503,9 +496,20 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         return '$unread unread of $total.';
 
       case 'refresh':
-        await agent.process('list_emails', context: null);
-        _syncAgentState(agent);
-        return null;
+        final currentFolder = ref.read(currentFolderProvider);
+        final queryMap = {
+          'inbox': 'in:inbox',
+          'sent': 'in:sent',
+          'drafts': 'in:drafts',
+          'starred': 'is:starred',
+          'spam': 'in:spam',
+          'trash': 'in:trash',
+          'unread': 'is:unread in:inbox'
+        };
+        final query = queryMap[currentFolder] ?? 'in:inbox';
+        final refreshedEmails = await gmail.listEmails(query: query, maxResults: 20);
+        ref.read(currentEmailsProvider.notifier).state = refreshedEmails;
+        return 'Refreshed. ${refreshedEmails.length} emails.';
 
       // === EMAIL SELECTION ===
       case 'open_email':
@@ -578,7 +582,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         final newEmails = List.of(emails)..removeAt(selectedIndex);
         ref.read(currentEmailsProvider.notifier).state = newEmails;
         ref.read(selectedEmailProvider.notifier).state = null;
-        ref.read(selectedEmailIndexProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
         return 'Deleted.';
 
       case 'delete_email':
@@ -590,7 +594,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         ref.read(currentEmailsProvider.notifier).state = newEmails;
         if (selectedIndex == number - 1) {
           ref.read(selectedEmailProvider.notifier).state = null;
-          ref.read(selectedEmailIndexProvider.notifier).state = null;
+          ref.read(selectedEmailIndexProvider.notifier).state = -1;
         }
         return 'Deleted.';
 
@@ -600,7 +604,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         final newEmails = List.of(emails)..removeAt(selectedIndex);
         ref.read(currentEmailsProvider.notifier).state = newEmails;
         ref.read(selectedEmailProvider.notifier).state = null;
-        ref.read(selectedEmailIndexProvider.notifier).state = null;
+        ref.read(selectedEmailIndexProvider.notifier).state = -1;
         return 'Archived.';
 
       case 'archive_email':
@@ -612,7 +616,7 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         ref.read(currentEmailsProvider.notifier).state = newEmails;
         if (selectedIndex == number - 1) {
           ref.read(selectedEmailProvider.notifier).state = null;
-          ref.read(selectedEmailIndexProvider.notifier).state = null;
+          ref.read(selectedEmailIndexProvider.notifier).state = -1;
         }
         return 'Archived.';
 
@@ -696,9 +700,8 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
 
       // === PAGINATION ===
       case 'more':
-        await agent.process('next_page', context: null);
-        _syncAgentState(agent);
-        return null;
+        // Load more emails (pagination - not yet fully implemented)
+        return 'More is not implemented yet.';
 
       // === SYSTEM ===
       case 'stop':
@@ -707,19 +710,35 @@ class _EmailScreenState extends ConsumerState<EmailScreen> {
         return 'Stopped.';
 
       case 'help':
-        return 'Say: show inbox, read email 1, delete, archive, next, open attachment.';
+        return 'Navigation: show inbox, unread, sent, starred. Reading: next, previous, email [number]. Actions: delete, archive, star. Attachments: open pdf. Say "list commands" for full list.';
+
+      case 'list_commands':
+        // Full list of all available commands
+        final allCommands = '''
+NAVIGATION: show inbox, show unread, show sent, show drafts, show starred, show spam, show trash, refresh, check inbox
+
+READING: email [1-9], next, previous, first, last
+
+ACTIONS: delete, archive, star, unstar, mark read, mark unread
+
+LABELS: label [name], remove label [name], show labels
+
+SEARCH: search [query], from [name]
+
+ATTACHMENTS: open attachment, open pdf
+
+COMPOSING: compose, reply, reply all, forward, send, cancel
+
+PDF: scroll up, scroll down, next page, previous page, zoom in, zoom out, close
+
+SYSTEM: help, stop
+''';
+        print(allCommands);
+        return 'Commands printed to console. Navigation: show inbox/sent/starred. Read: next, previous, email 1. Actions: delete, archive.';
 
       default:
         // Unknown command - let Claude handle it
         return null;
-    }
-  }
-
-  /// Sync GUI state from agent after tool execution
-  void _syncAgentState(EmailAgent agent) {
-    final agentEmails = agent.currentEmails;
-    if (agentEmails.isNotEmpty) {
-      ref.read(currentEmailsProvider.notifier).state = agentEmails;
     }
   }
 

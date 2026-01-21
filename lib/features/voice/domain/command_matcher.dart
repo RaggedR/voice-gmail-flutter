@@ -91,7 +91,8 @@ class CommandMatcher {
 
     // System
     'stop': ['stop', 'stop listening'],
-    'help': ['help', 'what can i say', 'commands'],
+    'help': ['help', 'what can i say'],
+    'list_commands': ['list commands', 'list all commands', 'commands', 'all commands', 'what commands'],
     'repeat': ['repeat', 'say again', 'what'],
   };
 
